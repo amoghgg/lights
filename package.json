@@ -1,0 +1,30 @@
+{
+  "name": "lights",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Gesture-cued theatrical lighting control — five hand gestures drive a virtual DMX rig, in the browser.",
+  "homepage": "https://lights.amoghbajpai.com",
+  "license": "MIT",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.18",
+    "next": "^16.2.4",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.5",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "autoprefixer": "10.4.20",
+    "postcss": "8.5.1",
+    "tailwindcss": "3.4.17",
+    "typescript": "5.7.3"
+  }
+}
