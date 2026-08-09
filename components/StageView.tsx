@@ -58,6 +58,9 @@ export default function StageView({ outputs, blackout }: { outputs: FixtureOutpu
         SETTING LINE
       </text>
 
+      {/* Everything the rig lights scales by one group opacity, so the render
+          loop can move the master without React re-rendering the stage. */}
+      <g style={{ opacity: "var(--rig-master, 1)" }}>
       {/* beams */}
       <g style={{ mixBlendMode: "screen" }}>
         {outputs.map((o, i) => {
@@ -117,6 +120,7 @@ export default function StageView({ outputs, blackout }: { outputs: FixtureOutpu
           </g>
         );
       })}
+      </g>
 
       {blackout && (
         <text

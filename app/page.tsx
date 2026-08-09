@@ -13,6 +13,12 @@ import { INITIAL_STATE, LightingState, applyCue, resolve, toUniverse, COLOUR_STA
 
 type Phase = "idle" | "loading" | "running" | "error";
 
+/** Chrome and Safari fire this once per decoded camera frame. Not in lib.dom yet. */
+type FrameCallbackVideo = HTMLVideoElement & {
+  requestVideoFrameCallback?: (cb: (now: number) => void) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+};
+
 const REST: EngineState = {
   label: "rest",
   hold: 0,
@@ -30,14 +36,22 @@ export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const landmarkerRef = useRef<HandLandmarker | null>(null);
   const engineRef = useRef(new GestureEngine());
-  const rafRef = useRef<number>(0);
+  const stopRef = useRef<(() => void) | null>(null);
   const armedRef = useRef(false);
   const lightingRef = useRef<LightingState>(INITIAL_STATE);
+
+  // Master moves every frame while a hand is moving, so it is painted straight
+  // to the DOM rather than held in React state. Re-rendering the page at frame
+  // rate was the latency — React was competing with inference for the thread.
+  const washRef = useRef({ r: 255, g: 187, b: 122, level: 0.5 });
+  const masterBarRef = useRef<HTMLDivElement>(null);
+  const masterTextRef = useRef<HTMLSpanElement>(null);
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string>("");
   const [armed, setArmed] = useState(false);
   const [lighting, setLighting] = useState<LightingState>(INITIAL_STATE);
+  const [masterUi, setMasterUi] = useState(INITIAL_STATE.master);
   const [engineState, setEngineState] = useState<EngineState>(REST);
   const [timing, setTiming] = useState<Timing>({ fps: 0, capture: 0, landmark: 0, classify: 0, total: 0 });
   const [events, setEvents] = useState<CueEvent[]>([]);
@@ -47,13 +61,13 @@ export default function Page() {
   const [delegate, setDelegate] = useState<"GPU" | "CPU">("GPU");
 
   const outputs = resolve(lighting);
-  const dmx = toUniverse(outputs);
+  const dmx = toUniverse(outputs, lighting.blackout ? 0 : masterUi);
 
   useEffect(() => {
     armedRef.current = armed;
   }, [armed]);
 
-  // Light the interface from the rig it is driving.
+  /** Recompute the ambient bounce whenever the *look* changes — not every frame. */
   useEffect(() => {
     const lit = outputs.filter((o) => o.intensity > 0.02);
     const total = lit.reduce((n, o) => n + o.intensity, 0) || 1;
@@ -65,18 +79,134 @@ export default function Page() {
       ],
       [0, 0, 0],
     );
+    washRef.current = {
+      r: Math.round(mix[0] / total),
+      g: Math.round(mix[1] / total),
+      b: Math.round(mix[2] / total),
+      level: total / outputs.length,
+    };
+    paint();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lighting]);
+
+  /** One cheap write per frame, no React involved. */
+  const paint = useCallback(() => {
+    const s = lightingRef.current;
+    const eff = s.blackout ? 0 : s.master;
+    const w = washRef.current;
     const root = document.documentElement.style;
-    root.setProperty("--wash-r", String(Math.round(mix[0] / total)));
-    root.setProperty("--wash-g", String(Math.round(mix[1] / total)));
-    root.setProperty("--wash-b", String(Math.round(mix[2] / total)));
-    root.setProperty("--wash-level", (lighting.blackout ? 0 : total / outputs.length).toFixed(3));
-  }, [outputs, lighting.blackout]);
+    root.setProperty("--rig-master", eff.toFixed(3));
+    root.setProperty("--wash-r", String(w.r));
+    root.setProperty("--wash-g", String(w.g));
+    root.setProperty("--wash-b", String(w.b));
+    root.setProperty("--wash-level", (w.level * eff).toFixed(3));
+    if (masterBarRef.current) masterBarRef.current.style.width = `${(eff * 100).toFixed(1)}%`;
+    if (masterTextRef.current) masterTextRef.current.textContent = `${Math.round(eff * 100)}%`;
+  }, []);
 
   useEffect(() => {
     if (!startedAt) return;
     const id = setInterval(() => setElapsed(Date.now() - startedAt), 500);
     return () => clearInterval(id);
   }, [startedAt]);
+
+  const runLoop = useCallback(() => {
+    const video = videoRef.current as FrameCallbackVideo | null;
+    const landmarker = landmarkerRef.current;
+    if (!video || !landmarker) return;
+
+    let lastTelemetry = 0;
+    let lastFrameAt = performance.now();
+    let fpsEma = 0;
+    let stopped = false;
+    let lastTimestamp = -1;
+
+    const process = () => {
+      if (stopped || video.readyState < 2) return;
+
+      const t0 = performance.now();
+      // detectForVideo rejects a repeated timestamp; guard rather than let it throw.
+      if (t0 <= lastTimestamp) return;
+      lastTimestamp = t0;
+
+      const dt = t0 - lastFrameAt;
+      lastFrameAt = t0;
+      fpsEma = fpsEma ? fpsEma + (1000 / Math.max(dt, 1) - fpsEma) * 0.1 : 1000 / Math.max(dt, 1);
+
+      let result;
+      try {
+        result = landmarker.detectForVideo(video, t0);
+      } catch {
+        return; // a dropped frame is not worth tearing the session down
+      }
+      const t1 = performance.now();
+
+      // Mirror x so the engine works in the coordinates the operator sees:
+      // a swipe that looks rightward on screen is a rightward swipe.
+      const hands = (result.landmarks ?? []).map((h) => h.map((p) => ({ x: 1 - p.x, y: p.y, z: p.z })));
+
+      const { fired, dimLevel } = engineRef.current.update(hands, t0);
+      const t2 = performance.now();
+
+      draw(hands);
+
+      if (armedRef.current) {
+        if (dimLevel !== null && !lightingRef.current.blackout) {
+          lightingRef.current = { ...lightingRef.current, master: dimLevel };
+        }
+        for (const cue of fired) {
+          lightingRef.current = applyCue(lightingRef.current, cue, dimLevel);
+          setLighting(lightingRef.current);
+          const at = Date.now();
+          setEvents((prev) => [...prev, { cue, at }]);
+          setLastFired({ cue, at });
+        }
+      }
+      paint();
+
+      if (t0 - lastTelemetry > 140) {
+        lastTelemetry = t0;
+        setEngineState({ ...engineRef.current.state });
+        setMasterUi(lightingRef.current.master);
+        setTiming({
+          fps: fpsEma,
+          capture: Math.min(dt, 200),
+          landmark: t1 - t0,
+          classify: t2 - t1,
+          total: t2 - t0,
+        });
+      }
+    };
+
+    // Drive off decoded camera frames where the browser offers it. rAF runs at
+    // display rate — 120Hz on a ProMotion Mac — which would run inference three
+    // or four times per camera frame for nothing.
+    if (typeof video.requestVideoFrameCallback === "function") {
+      const step = () => {
+        if (stopped) return;
+        process();
+        video.requestVideoFrameCallback!(step);
+      };
+      video.requestVideoFrameCallback(step);
+    } else {
+      const MIN_INTERVAL = 30; // ms — cap at ~33fps
+      let last = 0;
+      const step = () => {
+        if (stopped) return;
+        requestAnimationFrame(step);
+        const now = performance.now();
+        if (now - last < MIN_INTERVAL) return;
+        last = now;
+        process();
+      };
+      requestAnimationFrame(step);
+    }
+
+    stopRef.current = () => {
+      stopped = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paint]);
 
   const start = useCallback(async () => {
     setPhase("loading");
@@ -88,8 +218,8 @@ export default function Page() {
         runningMode: "VIDEO" as const,
         numHands: 2,
         minHandDetectionConfidence: 0.5,
-        minHandPresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5,
+        minHandPresenceConfidence: 0.4,
+        minTrackingConfidence: 0.4,
       };
       // GPU is faster where WebGL cooperates; plenty of machines and browsers
       // refuse it, and falling back beats failing to start.
@@ -108,7 +238,7 @@ export default function Page() {
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30, max: 30 } },
       });
       const video = videoRef.current!;
       video.srcObject = stream;
@@ -116,7 +246,8 @@ export default function Page() {
 
       setStartedAt(Date.now());
       setPhase("running");
-      loop();
+      paint();
+      runLoop();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(
@@ -126,79 +257,16 @@ export default function Page() {
       );
       setPhase("error");
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const loop = useCallback(() => {
-    const video = videoRef.current;
-    const landmarker = landmarkerRef.current;
-    if (!video || !landmarker) return;
-
-    let lastTelemetry = 0;
-    let lastFrameAt = performance.now();
-    let fpsEma = 0;
-
-    const tick = () => {
-      rafRef.current = requestAnimationFrame(tick);
-      if (video.readyState < 2) return;
-
-      const t0 = performance.now();
-      // Interval between frames — not true capture latency, which needs an
-      // external clock to measure. Reported as-is rather than dressed up.
-      const dt = t0 - lastFrameAt;
-      lastFrameAt = t0;
-      fpsEma = fpsEma ? fpsEma + (1000 / Math.max(dt, 1) - fpsEma) * 0.1 : 1000 / Math.max(dt, 1);
-
-      const result = landmarker.detectForVideo(video, t0);
-      const t1 = performance.now();
-
-      // Mirror x so the engine works in the coordinates the operator sees:
-      // a swipe that looks rightward on screen is a rightward swipe.
-      const hands = (result.landmarks ?? []).map((h) => h.map((p) => ({ x: 1 - p.x, y: p.y, z: p.z })));
-
-      const { fired, dimLevel } = engineRef.current.update(hands, t0);
-      const t2 = performance.now();
-
-      draw(hands);
-
-      if (armedRef.current) {
-        if (dimLevel !== null) {
-          const next = applyCue(lightingRef.current, "dim", dimLevel);
-          lightingRef.current = next;
-          setLighting(next);
-        }
-        for (const cue of fired) {
-          const next = applyCue(lightingRef.current, cue, dimLevel);
-          lightingRef.current = next;
-          setLighting(next);
-          setEvents((prev) => [...prev, { cue, at: Date.now() }]);
-          setLastFired({ cue, at: Date.now() });
-        }
-      }
-
-      if (t0 - lastTelemetry > 120) {
-        lastTelemetry = t0;
-        setEngineState({ ...engineRef.current.state });
-        setTiming({
-          fps: fpsEma,
-          capture: Math.min(dt, 100),
-          landmark: t1 - t0,
-          classify: t2 - t1,
-          total: t2 - t0,
-        });
-      }
-    };
-
-    rafRef.current = requestAnimationFrame(tick);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [paint, runLoop]);
 
   function draw(hands: { x: number; y: number; z: number }[][]) {
     const canvas = canvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) return;
-    const w = (canvas.width = video.videoWidth || 640);
-    const h = (canvas.height = video.videoHeight || 480);
+    const w = video.videoWidth || 640;
+    const h = video.videoHeight || 480;
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, w, h);
@@ -212,16 +280,16 @@ export default function Page() {
       [0, 17],
     ];
 
+    ctx.strokeStyle = "rgba(255,165,61,0.75)";
+    ctx.lineWidth = 2;
+    ctx.fillStyle = "#E8E4DC";
     for (const hand of hands) {
-      ctx.strokeStyle = "rgba(255,165,61,0.75)";
-      ctx.lineWidth = 2;
+      ctx.beginPath();
       for (const [a, b] of CONNECTIONS) {
-        ctx.beginPath();
         ctx.moveTo(hand[a].x * w, hand[a].y * h);
         ctx.lineTo(hand[b].x * w, hand[b].y * h);
-        ctx.stroke();
       }
-      ctx.fillStyle = "#E8E4DC";
+      ctx.stroke();
       for (const p of hand) {
         ctx.beginPath();
         ctx.arc(p.x * w, p.y * h, 2.5, 0, Math.PI * 2);
@@ -232,7 +300,7 @@ export default function Page() {
 
   useEffect(
     () => () => {
-      cancelAnimationFrame(rafRef.current);
+      stopRef.current?.();
       const v = videoRef.current;
       const s = v?.srcObject as MediaStream | null;
       s?.getTracks().forEach((t) => t.stop());
@@ -247,7 +315,9 @@ export default function Page() {
   function resetRig() {
     lightingRef.current = INITIAL_STATE;
     setLighting(INITIAL_STATE);
+    setMasterUi(INITIAL_STATE.master);
     engineRef.current.reset();
+    paint();
   }
 
   const flagged = events.filter((e) => e.flagged).length;
@@ -255,7 +325,6 @@ export default function Page() {
 
   return (
     <main className="min-h-screen">
-      {/* production desk rail */}
       <header className="border-b rule sticky top-0 z-20 bg-house/90 backdrop-blur-sm">
         <div className="max-w-[1400px] mx-auto px-4 h-14 flex items-center gap-4">
           <div className="flex items-baseline gap-2.5">
@@ -296,7 +365,6 @@ export default function Page() {
       </header>
 
       <div className="max-w-[1400px] mx-auto px-4 py-5 space-y-4">
-        {/* the thesis: what it sees, and what it does */}
         <div className="grid lg:grid-cols-2 gap-4">
           <section className="panel p-3">
             <div className="flex items-center justify-between mb-2.5">
@@ -365,25 +433,19 @@ export default function Page() {
               <span className="eyebrow">Output</span>
               <span className="font-mono text-[10px] text-plot-dim">
                 {lighting.blackout ? "blackout" : lighting.look === "none" ? "open white" : lighting.look} ·{" "}
-                {Math.round(lighting.master * 100)}% · {gel.gel}
+                {gel.gel}
               </span>
             </div>
             <StageView outputs={outputs} blackout={lighting.blackout} />
 
-            {/* Master, as a fader — the only way to see a continuous cue tracking. */}
+            {/* Master, as a fader. Painted directly by the render loop. */}
             <div className="mt-3 flex items-center gap-3">
               <span className="font-mono text-[9px] tracking-cue uppercase text-plot-faint shrink-0">Master</span>
               <div className="relative flex-1 h-1.5 bg-house overflow-hidden">
-                <div
-                  className="absolute inset-y-0 left-0 bg-tungsten"
-                  style={{
-                    width: `${(lighting.blackout ? 0 : lighting.master) * 100}%`,
-                    transition: "width 60ms linear",
-                  }}
-                />
+                <div ref={masterBarRef} className="absolute inset-y-0 left-0 bg-tungsten" style={{ width: "80%" }} />
               </div>
-              <span className="font-mono text-[10px] tnum text-plot w-9 text-right shrink-0">
-                {Math.round((lighting.blackout ? 0 : lighting.master) * 100)}%
+              <span ref={masterTextRef} className="font-mono text-[10px] tnum text-plot w-9 text-right shrink-0">
+                80%
               </span>
             </div>
           </section>

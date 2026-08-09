@@ -89,10 +89,16 @@ export type FixtureOutput = {
   rgb: readonly [number, number, number];
 };
 
-/** Resolve the abstract state into a per-fixture output. */
+/**
+ * Resolve the abstract state into a per-fixture output — *before* the master.
+ *
+ * The master is deliberately left out. It changes every frame while a hand is
+ * moving, and folding it in here would mean re-rendering the whole stage at
+ * frame rate. Instead it is applied as one group opacity in the SVG, driven by
+ * a CSS variable the render loop writes directly.
+ */
 export function resolve(s: LightingState): FixtureOutput[] {
   const colour = COLOUR_STATES[s.colour].rgb;
-  const m = s.blackout ? 0 : s.master;
 
   return RIG.map((fixture) => {
     let intensity = 0;
@@ -112,16 +118,16 @@ export function resolve(s: LightingState): FixtureOutput[] {
       rgb = colour;
     }
 
-    return { fixture, intensity: intensity * m, rgb };
+    return { fixture, intensity, rgb };
   });
 }
 
-/** Pack the resolved rig into a real 512-channel universe. */
-export function toUniverse(outputs: FixtureOutput[]): Uint8Array {
+/** Pack the resolved rig into a real 512-channel universe, master applied. */
+export function toUniverse(outputs: FixtureOutput[], master: number): Uint8Array {
   const dmx = new Uint8Array(512);
   for (const { fixture, intensity, rgb } of outputs) {
     const base = fixture.patch - 1;
-    const level = Math.round(intensity * 255);
+    const level = Math.round(intensity * master * 255);
     dmx[base] = level;
     if (fixture.kind !== "profile") {
       dmx[base + 1] = rgb[0];

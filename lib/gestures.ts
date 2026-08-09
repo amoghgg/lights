@@ -84,13 +84,16 @@ export const CUES: {
   },
 ];
 
-// --- thresholds, all in hand-spans or normalised frame units -----------------
+// --- thresholds, in hand-spans, normalised frame units, or ms ----------------
 
-const CLAP_TOGETHER = 1.15;
-const CLAP_APART = 2.2;
-const CLAP_CLOSING_SPEED = 5.5; // spans per second
+const CLAP_TOGETHER = 1.3; // palms this close counts as contact
+const CLAP_APART = 2.2; // palms this far apart re-arms the detector
+const CLAP_LOST_SEP = 2.4; // how close they must have been when tracking dropped
+const CLAP_CLOSING_SPEED = 4.5; // spans per second
+const CLAP_LOST_GRACE = 260; // ms after losing the pair that a clap still counts
+const CLAP_REARM_AFTER = 240; // ms — re-arm even if the pair is never re-acquired
 const CLAP_MIN_GAP = 120; // ms — below this it is one clap seen twice
-const CLAP_MAX_GAP = 800; // ms — above this it is two separate claps
+const CLAP_MAX_GAP = 900; // ms — above this it is two separate claps
 
 const COVER_HOLD = 400; // ms
 // Wrists must sit above this line. Generous, because a seated operator at a
@@ -104,15 +107,21 @@ const POINT_STILLNESS = 0.035; // max palm travel per frame while "held"
 // operator to hold a specific palm angle while also watching the stage was a
 // design mistake: the gesture has to survive being performed without looking.
 const DIM_MIN_FINGERS = 3;
-// EMA on the output level. High enough to feel immediate, low enough that
-// landmark jitter does not read as flicker on stage.
 const DIM_SMOOTHING = 0.4;
 
 const SWIPE_WINDOW = 350; // ms
 const SWIPE_TRAVEL = 0.22; // normalised frame widths
+const SWIPE_MIN_SAMPLES = 3; // frames — low, so a dropped frame does not kill it
 const SWIPE_COOLDOWN = 900; // ms
 
-const GLOBAL_COOLDOWN = 450; // ms after any discrete cue
+const GLOBAL_COOLDOWN = 350; // ms after any discrete cue
+
+/**
+ * Hand count flickers between one and two constantly at the edge of detection.
+ * Switching cue branch on every flicker resets every hold timer, so the branch
+ * follows a debounced count while the clap detector below reads the raw one.
+ */
+const HAND_COUNT_DEBOUNCE = 110; // ms
 
 type Sample = { t: number; sep: number; x: number };
 
@@ -140,18 +149,31 @@ export type EngineState = {
 
 export class GestureEngine {
   private history: Sample[] = [];
-  private lastClapAt = 0;
-  private pendingClapAt = 0;
+
+  // clap
   private clapArmed = true;
+  private lastClapAt = 0;
+  private lastClapEventAt = 0;
+  private lastPairSep: number | null = null;
+  private lastPairAt = 0;
+  private lastClosingSpeed = 0;
+
+  // holds
   private coverSince = 0;
   private coverLatched = false;
   private pointSince = 0;
   private pointLatched = false;
+
   private lastSwipeAt = 0;
   private lastCueAt = 0;
   private dimEma: number | null = null;
   private prevPalmX: number | null = null;
   private prevPalmY: number | null = null;
+
+  // hand-count debounce
+  private stableCount = 0;
+  private candidateCount = 0;
+  private candidateSince = 0;
 
   state: EngineState = {
     label: "rest",
@@ -174,6 +196,9 @@ export class GestureEngine {
     this.dimEma = null;
     this.prevPalmX = null;
     this.prevPalmY = null;
+    this.lastPairSep = null;
+    this.clapArmed = true;
+    this.lastClapAt = 0;
   }
 
   /**
@@ -191,56 +216,72 @@ export class GestureEngine {
     const check = (cue: CueId, label: string, ok: boolean, detail: string) =>
       this.state.checks.push({ cue, label, ok, detail });
 
-    if (hands.length === 0) {
+    const cooling = t - this.lastCueAt < GLOBAL_COOLDOWN;
+
+    // --- clap, on the raw hand count ----------------------------------------
+    if (this.detectClap(hands, t) && !cooling) {
+      const gap = t - this.lastClapAt;
+      if (this.lastClapAt && gap > CLAP_MIN_GAP && gap < CLAP_MAX_GAP) {
+        fired.push("blackout");
+        this.lastCueAt = t;
+        this.lastClapAt = 0;
+      } else {
+        this.lastClapAt = t;
+      }
+    }
+    if (this.lastClapAt && t - this.lastClapAt > CLAP_MAX_GAP) this.lastClapAt = 0;
+    this.state.clapArmed = this.clapArmed;
+    this.state.clapsInWindow = this.lastClapAt ? 1 : 0;
+
+    check(
+      "blackout",
+      "armed (palms apart)",
+      this.clapArmed,
+      this.clapArmed ? "ok" : "separate your hands to re-arm",
+    );
+    check(
+      "blackout",
+      "first clap seen",
+      this.lastClapAt > 0,
+      this.lastClapAt > 0 ? "waiting for the second" : "clap once, then again",
+    );
+
+    // --- debounced hand count decides which cue branch runs -----------------
+    const raw = hands.length;
+    if (raw !== this.candidateCount) {
+      this.candidateCount = raw;
+      this.candidateSince = t;
+    }
+    if (t - this.candidateSince >= HAND_COUNT_DEBOUNCE || this.stableCount === 0) {
+      this.stableCount = this.candidateCount;
+    }
+    const count = Math.min(this.stableCount, hands.length);
+
+    if (count === 0 || hands.length === 0) {
       this.clearHolds();
-      this.state.label = "rest";
+      this.state.label = fired.length ? "blackout" : "rest";
       this.state.hold = 0;
       this.state.dimLevel = null;
       this.dimEma = null;
-      check("blackout", "hand visible", false, "no hand in frame");
       return { fired, dimLevel };
     }
 
-    const cooling = t - this.lastCueAt < GLOBAL_COOLDOWN;
-
-    // --- two-handed cues take priority; they cannot be confused with the rest
-    if (hands.length === 2) {
+    if (count === 2) {
       const [a, b] = hands;
       const sep = palmSeparation(a, b);
       this.state.separation = sep;
-      this.history.push({ t, sep, x: palmCenter(a).x });
-      this.trimHistory(t);
 
-      // cue 1 — double clap
-      if (this.detectClap(t, sep) && !cooling) {
-        const gap = t - this.lastClapAt;
-        if (gap > CLAP_MIN_GAP && gap < CLAP_MAX_GAP) {
-          fired.push("blackout");
-          this.lastCueAt = t;
-          this.lastClapAt = 0;
-          this.pendingClapAt = 0;
-        } else {
-          this.lastClapAt = t;
-          this.pendingClapAt = t;
-        }
-      }
-      if (t - this.lastClapAt > CLAP_MAX_GAP) this.pendingClapAt = 0;
-
-      // cue 2 — both palms open and raised
       const bothOpen = isOpenPalm(a) && isOpenPalm(b);
       const lowerWrist = Math.max(a[0].y, b[0].y);
       const bothRaised = lowerWrist < COVER_RAISED_Y;
 
-      check("blackout", "two hands", true, "ok");
-      check("blackout", "armed (palms apart)", this.clapArmed, `sep ${sep.toFixed(2)} span`);
-      check("blackout", "palms together", sep < CLAP_TOGETHER, `need < ${CLAP_TOGETHER}, at ${sep.toFixed(2)}`);
       check(
         "cover",
         "both palms open",
         bothOpen,
         bothOpen ? "ok" : `${[isOpenPalm(a), isOpenPalm(b)].filter(Boolean).length}/2 open`,
       );
-      check("cover", "wrists raised", bothRaised, `lower wrist at y ${lowerWrist.toFixed(2)}, need < ${COVER_RAISED_Y}`);
+      check("cover", "wrists raised", bothRaised, `lower wrist y ${lowerWrist.toFixed(2)}, need < ${COVER_RAISED_Y}`);
       check("cover", "hands apart", sep > CLAP_APART, `sep ${sep.toFixed(2)}, need > ${CLAP_APART}`);
 
       if (bothOpen && bothRaised && sep > CLAP_APART) {
@@ -261,9 +302,8 @@ export class GestureEngine {
 
       this.pointSince = 0;
       this.pointLatched = false;
-      this.state.clapsInWindow = this.pendingClapAt ? 1 : 0;
       this.state.dimLevel = null;
-      if (fired.length === 0 && this.state.label !== "cover") this.state.label = "rest";
+      if (!fired.length && this.state.label !== "cover") this.state.label = "rest";
       return { fired, dimLevel };
     }
 
@@ -274,7 +314,6 @@ export class GestureEngine {
     this.trimHistory(t);
     this.coverSince = 0;
     this.coverLatched = false;
-    this.state.clapsInWindow = this.pendingClapAt ? 1 : 0;
 
     const travel =
       this.prevPalmX === null
@@ -300,10 +339,7 @@ export class GestureEngine {
       `moved ${Math.abs(swipeTravel).toFixed(2)}, need > ${SWIPE_TRAVEL} in ${SWIPE_WINDOW}ms`,
     );
 
-    // cue 5 — lateral swipe. Checked before the static cues because a hand in
-    // motion is never a held pose.
-    const swipe = this.detectSwipe(t);
-    if (swipe && !cooling && t - this.lastSwipeAt > SWIPE_COOLDOWN) {
+    if (this.detectSwipe(t) && !cooling && t - this.lastSwipeAt > SWIPE_COOLDOWN) {
       fired.push("colour");
       this.lastSwipeAt = t;
       this.lastCueAt = t;
@@ -313,8 +349,7 @@ export class GestureEngine {
       return { fired, dimLevel };
     }
 
-    // cue 3 — point and hold
-    if (isPointing(hand) && travel < POINT_STILLNESS) {
+    if (pointing && travel < POINT_STILLNESS) {
       if (!this.pointSince) this.pointSince = t;
       const held = t - this.pointSince;
       this.state.label = "special";
@@ -330,11 +365,10 @@ export class GestureEngine {
     this.pointSince = 0;
     this.pointLatched = false;
 
-    // cue 4 — an open hand drives the master, continuously, wherever it points
     if (f0.count >= DIM_MIN_FINGERS) {
-      // wrist near the top of frame is full, near the bottom is out
-      const raw = 1 - Math.min(1, Math.max(0, (centre.y - 0.15) / 0.7));
-      this.dimEma = this.dimEma === null ? raw : this.dimEma + (raw - this.dimEma) * DIM_SMOOTHING;
+      const rawLevel = 1 - Math.min(1, Math.max(0, (centre.y - 0.15) / 0.7));
+      this.dimEma =
+        this.dimEma === null ? rawLevel : this.dimEma + (rawLevel - this.dimEma) * DIM_SMOOTHING;
       dimLevel = this.dimEma;
       this.state.label = "dim";
       this.state.hold = 1;
@@ -343,50 +377,85 @@ export class GestureEngine {
     }
 
     this.dimEma = null;
-    this.state.label = "rest";
+    this.state.label = fired.length ? "colour" : "rest";
     this.state.hold = 0;
     this.state.dimLevel = null;
     return { fired, dimLevel };
   }
 
   /**
-   * A clap is the palms closing fast, not merely being close together — resting
-   * hands sit near each other all the time. Requiring the closing *speed* is
-   * what keeps this off the false-trigger list.
+   * A clap, detected without ever seeing the hands touch.
+   *
+   * MediaPipe routinely drops from two hands to one — or none — at the moment
+   * two palms meet, because the merged blob stops looking like two hands. The
+   * contact frame is exactly the frame the tracker loses. So contact is treated
+   * as either "separation collapsed" *or* "the pair vanished while closing
+   * fast", and the second case is the one that actually fires in practice.
    */
-  private detectClap(t: number, sep: number): boolean {
-    if (sep > CLAP_APART) this.clapArmed = true;
-    this.state.clapArmed = this.clapArmed;
-    if (!this.clapArmed || sep > CLAP_TOGETHER) return false;
+  private detectClap(hands: Hand[], t: number): boolean {
+    // re-arm on time even if the pair is never cleanly re-acquired
+    if (!this.clapArmed && t - this.lastClapEventAt > CLAP_REARM_AFTER) this.clapArmed = true;
 
-    const prior = this.history.filter((s) => t - s.t > 30 && t - s.t < 200 && !Number.isNaN(s.sep));
-    if (prior.length === 0) return false;
-    const oldest = prior[0];
-    const speed = (oldest.sep - sep) / Math.max((t - oldest.t) / 1000, 1e-3);
-    if (speed < CLAP_CLOSING_SPEED) return false;
+    if (hands.length === 2) {
+      const sep = palmSeparation(hands[0], hands[1]);
+      this.history.push({ t, sep, x: palmCenter(hands[0]).x });
+      this.trimHistory(t);
 
-    this.clapArmed = false;
-    return true;
+      const prior = this.history.filter((s) => t - s.t > 25 && t - s.t < 220 && !Number.isNaN(s.sep));
+      const speed = prior.length
+        ? (prior[0].sep - sep) / Math.max((t - prior[0].t) / 1000, 1e-3)
+        : 0;
+      this.lastClosingSpeed = speed;
+      this.lastPairSep = sep;
+      this.lastPairAt = t;
+
+      if (sep > CLAP_APART) this.clapArmed = true;
+
+      if (this.clapArmed && sep < CLAP_TOGETHER && speed > CLAP_CLOSING_SPEED) {
+        this.clapArmed = false;
+        this.lastClapEventAt = t;
+        return true;
+      }
+      return false;
+    }
+
+    // The pair just disappeared. If it was closing fast and was already close,
+    // the hands met — the tracker simply could not see it happen.
+    if (
+      this.clapArmed &&
+      this.lastPairSep !== null &&
+      t - this.lastPairAt < CLAP_LOST_GRACE &&
+      this.lastPairSep < CLAP_LOST_SEP &&
+      this.lastClosingSpeed > CLAP_CLOSING_SPEED
+    ) {
+      this.clapArmed = false;
+      this.lastClapEventAt = t;
+      this.lastPairSep = null;
+      return true;
+    }
+    return false;
   }
 
   /** Net sideways travel over the swipe window, signed. Read-only — for the readout. */
   private swipeTravel(t: number): number {
     const win = this.history.filter((s) => t - s.t <= SWIPE_WINDOW);
-    if (win.length < 4) return 0;
+    if (win.length < SWIPE_MIN_SAMPLES) return 0;
     return win[win.length - 1].x - win[0].x;
   }
 
   private detectSwipe(t: number): boolean {
     const win = this.history.filter((s) => t - s.t <= SWIPE_WINDOW);
-    if (win.length < 4) return false;
+    if (win.length < SWIPE_MIN_SAMPLES) return false;
     const dx = win[win.length - 1].x - win[0].x;
     if (Math.abs(dx) < SWIPE_TRAVEL) return false;
-    // every step must move the same way, so a wave back and forth is not a swipe
+    // Allow one reversal: at 20fps a single jittery landmark should not veto an
+    // otherwise clean swipe.
     const sign = Math.sign(dx);
+    let against = 0;
     for (let i = 1; i < win.length; i++) {
-      if (Math.sign(win[i].x - win[i - 1].x) === -sign) return false;
+      if (Math.sign(win[i].x - win[i - 1].x) === -sign) against++;
     }
-    return true;
+    return against <= 1;
   }
 
   private trimHistory(t: number) {
