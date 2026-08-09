@@ -2,14 +2,27 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HandLandmarker } from "@mediapipe/tasks-vision";
+import Coach from "@/components/Coach";
 import CueRail from "@/components/CueRail";
 import Diagnostics from "@/components/Diagnostics";
 import EventLog from "@/components/EventLog";
 import StageView from "@/components/StageView";
 import Telemetry, { type Timing } from "@/components/Telemetry";
 import Universe from "@/components/Universe";
+import { COACH_STEPS, DIM_LEARN_RANGE } from "@/lib/coach";
 import { CueEvent, CueId, EngineState, GestureEngine } from "@/lib/gestures";
-import { INITIAL_STATE, LightingState, applyCue, resolve, toUniverse, COLOUR_STATES } from "@/lib/lighting";
+import {
+  BLACKOUT_IN_MS,
+  COLOUR_STATES,
+  FADE_MS,
+  INITIAL_STATE,
+  LevelFader,
+  LightingState,
+  RigFader,
+  applyCue,
+  frameToUniverse,
+  resolve,
+} from "@/lib/lighting";
 
 type Phase = "idle" | "loading" | "running" | "error";
 
@@ -43,9 +56,20 @@ export default function Page() {
   // Master moves every frame while a hand is moving, so it is painted straight
   // to the DOM rather than held in React state. Re-rendering the page at frame
   // rate was the latency — React was competing with inference for the thread.
-  const washRef = useRef({ r: 255, g: 187, b: 122, level: 0.5 });
   const masterBarRef = useRef<HTMLDivElement>(null);
   const masterTextRef = useRef<HTMLSpanElement>(null);
+
+  // Look changes fade over a cue's count; the master does not fade, because it
+  // is the operator's hand. Blackout rides its own one-dimensional fade.
+  const faderRef = useRef(new RigFader(resolve(INITIAL_STATE)));
+  const blackoutFaderRef = useRef(new LevelFader(1));
+  const liveFrameRef = useRef(
+    resolve(INITIAL_STATE).map((o) => ({
+      intensity: o.intensity,
+      rgb: [...o.rgb] as [number, number, number],
+    })),
+  );
+  const effMasterRef = useRef(INITIAL_STATE.master);
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string>("");
@@ -60,49 +84,98 @@ export default function Page() {
   const [elapsed, setElapsed] = useState(0);
   const [delegate, setDelegate] = useState<"GPU" | "CPU">("GPU");
 
-  const outputs = resolve(lighting);
-  const dmx = toUniverse(outputs, lighting.blackout ? 0 : masterUi);
+  // walkthrough: -1 is off, COACH_STEPS.length is the closing card
+  const [coachStep, setCoachStep] = useState(-1);
+  const [coachSatisfied, setCoachSatisfied] = useState(false);
+  const coachStepRef = useRef(-1);
+  const coachSatisfiedRef = useRef(false);
+  const dimRangeRef = useRef({ min: 1, max: 0 });
+
+  const [dmx, setDmx] = useState<Uint8Array>(() =>
+    frameToUniverse(
+      resolve(INITIAL_STATE).map((o) => ({ intensity: o.intensity, rgb: [...o.rgb] as [number, number, number] })),
+      INITIAL_STATE.master,
+    ),
+  );
 
   useEffect(() => {
     armedRef.current = armed;
   }, [armed]);
 
-  /** Recompute the ambient bounce whenever the *look* changes — not every frame. */
+  /** Entering a step clears whatever the last one was measuring. */
   useEffect(() => {
-    const lit = outputs.filter((o) => o.intensity > 0.02);
-    const total = lit.reduce((n, o) => n + o.intensity, 0) || 1;
-    const mix = lit.reduce(
-      (acc, o) => [
-        acc[0] + o.rgb[0] * o.intensity,
-        acc[1] + o.rgb[1] * o.intensity,
-        acc[2] + o.rgb[2] * o.intensity,
-      ],
-      [0, 0, 0],
-    );
-    washRef.current = {
-      r: Math.round(mix[0] / total),
-      g: Math.round(mix[1] / total),
-      b: Math.round(mix[2] / total),
-      level: total / outputs.length,
-    };
-    paint();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lighting]);
+    coachStepRef.current = coachStep;
+    coachSatisfiedRef.current = false;
+    dimRangeRef.current = { min: 1, max: 0 };
+  }, [coachStep]);
 
-  /** One cheap write per frame, no React involved. */
-  const paint = useCallback(() => {
-    const s = lightingRef.current;
-    const eff = s.blackout ? 0 : s.master;
-    const w = washRef.current;
+  /** Let the confirmation land before moving on — advancing instantly reads as a glitch. */
+  useEffect(() => {
+    if (!coachSatisfied) return;
+    const id = setTimeout(() => {
+      setCoachSatisfied(false);
+      setCoachStep((s) => s + 1);
+    }, 1600);
+    return () => clearTimeout(id);
+  }, [coachSatisfied]);
+
+  const startCoach = useCallback(() => {
+    setCoachStep(0);
+    setCoachSatisfied(false);
+    setArmed(true); // a walkthrough where nothing fires teaches nothing
+  }, []);
+
+  const exitCoach = useCallback(() => {
+    setCoachStep(-1);
+    setCoachSatisfied(false);
+    try {
+      localStorage.setItem("lights.taught", "1");
+    } catch {
+      /* private mode — just show it again next time */
+    }
+  }, []);
+
+  /**
+   * Steps both fades and writes the result straight to CSS variables. Every
+   * value that moves during a three-second crossfade moves here — no React.
+   */
+  const paint = useCallback((now = performance.now()) => {
+    const frame = faderRef.current.step(now);
+    const blackoutMul = blackoutFaderRef.current.step(now);
+    const eff = lightingRef.current.master * blackoutMul;
+    liveFrameRef.current = frame;
+    effMasterRef.current = eff;
+
     const root = document.documentElement.style;
     root.setProperty("--rig-master", eff.toFixed(3));
-    root.setProperty("--wash-r", String(w.r));
-    root.setProperty("--wash-g", String(w.g));
-    root.setProperty("--wash-b", String(w.b));
-    root.setProperty("--wash-level", (w.level * eff).toFixed(3));
+
+    let wr = 0;
+    let wg = 0;
+    let wb = 0;
+    let total = 0;
+    frame.forEach((f, i) => {
+      root.setProperty(`--fx${i}-a`, f.intensity.toFixed(3));
+      root.setProperty(`--fx${i}-s`, (0.3 + f.intensity * 0.7).toFixed(3));
+      root.setProperty(`--fx${i}-c`, `rgb(${f.rgb[0]},${f.rgb[1]},${f.rgb[2]})`);
+      wr += f.rgb[0] * f.intensity;
+      wg += f.rgb[1] * f.intensity;
+      wb += f.rgb[2] * f.intensity;
+      total += f.intensity;
+    });
+
+    const d = total || 1;
+    root.setProperty("--wash-r", String(Math.round(wr / d)));
+    root.setProperty("--wash-g", String(Math.round(wg / d)));
+    root.setProperty("--wash-b", String(Math.round(wb / d)));
+    root.setProperty("--wash-level", ((total / frame.length) * eff).toFixed(3));
+
     if (masterBarRef.current) masterBarRef.current.style.width = `${(eff * 100).toFixed(1)}%`;
     if (masterTextRef.current) masterTextRef.current.textContent = `${Math.round(eff * 100)}%`;
   }, []);
+
+  useEffect(() => {
+    paint();
+  }, [paint]);
 
   useEffect(() => {
     if (!startedAt) return;
@@ -155,19 +228,57 @@ export default function Page() {
           lightingRef.current = { ...lightingRef.current, master: dimLevel };
         }
         for (const cue of fired) {
-          lightingRef.current = applyCue(lightingRef.current, cue, dimLevel);
-          setLighting(lightingRef.current);
+          const prev = lightingRef.current;
+          const next = applyCue(prev, cue, dimLevel);
+          lightingRef.current = next;
+
+          // Every look change is a timed crossfade. Snapping between looks
+          // reads as a fault on real fixtures — and on tungsten it is not
+          // physically possible anyway.
+          faderRef.current.setTarget(resolve(next), FADE_MS[cue], t0);
+          if (next.blackout !== prev.blackout) {
+            blackoutFaderRef.current.setTarget(
+              next.blackout ? 0 : 1,
+              next.blackout ? FADE_MS.blackout : BLACKOUT_IN_MS,
+              t0,
+            );
+          }
+
+          setLighting(next);
           const at = Date.now();
-          setEvents((prev) => [...prev, { cue, at }]);
+          setEvents((prev2) => [...prev2, { cue, at }]);
           setLastFired({ cue, at });
         }
       }
-      paint();
+      paint(t0);
+
+      // Has the current walkthrough step been performed?
+      const cs = coachStepRef.current;
+      if (cs >= 0 && cs < COACH_STEPS.length && !coachSatisfiedRef.current) {
+        const watch = COACH_STEPS[cs].watch;
+        let ok = false;
+        if (watch.kind === "hand") {
+          ok = hands.length > 0;
+        } else if (watch.kind === "dim") {
+          const m = lightingRef.current.master;
+          const r = dimRangeRef.current;
+          r.min = Math.min(r.min, m);
+          r.max = Math.max(r.max, m);
+          ok = r.max - r.min > DIM_LEARN_RANGE;
+        } else {
+          ok = fired.includes(watch.cue);
+        }
+        if (ok) {
+          coachSatisfiedRef.current = true;
+          setCoachSatisfied(true);
+        }
+      }
 
       if (t0 - lastTelemetry > 140) {
         lastTelemetry = t0;
         setEngineState({ ...engineRef.current.state });
         setMasterUi(lightingRef.current.master);
+        setDmx(frameToUniverse(liveFrameRef.current, effMasterRef.current));
         setTiming({
           fps: fpsEma,
           capture: Math.min(dt, 200),
@@ -248,6 +359,14 @@ export default function Page() {
       setPhase("running");
       paint();
       runLoop();
+
+      let taught = false;
+      try {
+        taught = localStorage.getItem("lights.taught") === "1";
+      } catch {
+        /* ignore */
+      }
+      if (!taught) startCoach();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(
@@ -257,7 +376,7 @@ export default function Page() {
       );
       setPhase("error");
     }
-  }, [paint, runLoop]);
+  }, [paint, runLoop, startCoach]);
 
   function draw(hands: { x: number; y: number; z: number }[][]) {
     const canvas = canvasRef.current;
@@ -316,12 +435,16 @@ export default function Page() {
     lightingRef.current = INITIAL_STATE;
     setLighting(INITIAL_STATE);
     setMasterUi(INITIAL_STATE.master);
+    faderRef.current.snapTo(resolve(INITIAL_STATE));
+    blackoutFaderRef.current.setTarget(1, 1, performance.now());
     engineRef.current.reset();
     paint();
   }
 
   const flagged = events.filter((e) => e.flagged).length;
   const gel = COLOUR_STATES[lighting.colour];
+  // The count the last cue ran on, the way a cue sheet would note it.
+  const lastFade = lastFired ? FADE_MS[lastFired.cue] : null;
 
   return (
     <main className="min-h-screen">
@@ -341,8 +464,14 @@ export default function Page() {
                   {timing.fps.toFixed(0)} fps · {timing.total.toFixed(0)} ms · {delegate}
                 </span>
                 <button
-                  onClick={resetRig}
+                  onClick={startCoach}
                   className="font-mono text-[10px] tracking-cue uppercase px-2.5 py-1.5 border border-house-edge text-plot-dim hover:text-plot hover:border-plot-faint transition-colors"
+                >
+                  Walkthrough
+                </button>
+                <button
+                  onClick={resetRig}
+                  className="font-mono text-[10px] tracking-cue uppercase px-2.5 py-1.5 border border-house-edge text-plot-dim hover:text-plot hover:border-plot-faint transition-colors hidden sm:block"
                 >
                   Reset rig
                 </button>
@@ -397,7 +526,12 @@ export default function Page() {
                     </>
                   ) : (
                     <>
-                      <p className="font-mono text-[11px] text-plot-dim max-w-xs leading-relaxed">
+                      <h2 className="font-display text-3xl leading-none text-plot">Five gestures, one rig</h2>
+                      <p className="font-mono text-[11px] text-plot-dim max-w-sm leading-relaxed">
+                        Your hands drive a theatrical lighting rig — blackout, wash, a centre special, the
+                        master, and colour. A short walkthrough teaches you each cue.
+                      </p>
+                      <p className="font-mono text-[10px] text-plot-faint max-w-xs leading-relaxed">
                         Everything runs in this tab. The camera feed never leaves your machine.
                       </p>
                       <button
@@ -412,7 +546,19 @@ export default function Page() {
                 </div>
               )}
 
-              {phase === "running" && !armed && (
+              {phase === "running" && coachStep >= 0 && (
+                <Coach
+                  step={coachStep}
+                  satisfied={coachSatisfied}
+                  onSkip={() => {
+                    setCoachSatisfied(false);
+                    setCoachStep((s) => s + 1);
+                  }}
+                  onExit={exitCoach}
+                />
+              )}
+
+              {phase === "running" && coachStep < 0 && !armed && (
                 <div className="absolute bottom-2 left-2 right-2 flex items-center gap-3 px-3 py-2 bg-house/95 border border-tungsten/50">
                   <p className="font-mono text-[10px] text-tungsten leading-snug flex-1">
                     Tracking, but cues will not fire. Arm the system to take the rig live.
@@ -434,9 +580,10 @@ export default function Page() {
               <span className="font-mono text-[10px] text-plot-dim">
                 {lighting.blackout ? "blackout" : lighting.look === "none" ? "open white" : lighting.look} ·{" "}
                 {gel.gel}
+                {lastFade && <span className="text-tungsten"> · {(lastFade / 1000).toFixed(1)}s count</span>}
               </span>
             </div>
-            <StageView outputs={outputs} blackout={lighting.blackout} />
+            <StageView blackout={lighting.blackout} />
 
             {/* Master, as a fader. Painted directly by the render loop. */}
             <div className="mt-3 flex items-center gap-3">

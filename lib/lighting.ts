@@ -140,3 +140,130 @@ export function toUniverse(outputs: FixtureOutput[], master: number): Uint8Array
 
 /** Highest channel the rig touches — everything above is dead air on the plot. */
 export const PATCHED_CHANNELS = 25;
+
+/**
+ * Fade times, in milliseconds — the "count" a board operator would write on the
+ * cue sheet. Nothing snaps except by choice: a hard cut between looks reads as a
+ * fault on real fixtures, and on tungsten it is physically impossible anyway.
+ *
+ * The master is absent because it does not fade. It is the operator's hand, live.
+ */
+export const FADE_MS: Record<CueId, number> = {
+  blackout: 1000, // going out — quick, but still a fade
+  cover: 3000, // a warm build to full
+  special: 2500, // wash out as the profile comes in
+  colour: 2000, // gels crossfade slowly or it reads as a glitch
+  dim: 0, // tracks the hand, never interpolated
+};
+
+/** Coming back in is slower than going out — a stage that snaps on blinds people. */
+export const BLACKOUT_IN_MS = 1800;
+
+type Frame = { intensity: number; rgb: [number, number, number] }[];
+
+const snapshot = (o: FixtureOutput[]): Frame =>
+  o.map((f) => ({ intensity: f.intensity, rgb: [f.rgb[0], f.rgb[1], f.rgb[2]] }));
+
+/**
+ * Interpolates the rig from one look to the next over a cue's fade time.
+ *
+ * Interpolation is linear in DMX space, which is what a desk running a linear
+ * fade profile actually does — easing here would look smoother on screen and be
+ * wrong about the thing this is simulating.
+ */
+export class RigFader {
+  private from: Frame;
+  private to: Frame;
+  private cur: Frame;
+  private startedAt = 0;
+  private duration = 1;
+
+  constructor(initial: FixtureOutput[]) {
+    this.cur = snapshot(initial);
+    this.from = snapshot(initial);
+    this.to = snapshot(initial);
+  }
+
+  setTarget(target: FixtureOutput[], durationMs: number, now: number) {
+    this.from = this.cur.map((f) => ({ intensity: f.intensity, rgb: [...f.rgb] as [number, number, number] }));
+    this.to = snapshot(target);
+    this.startedAt = now;
+    this.duration = Math.max(durationMs, 1);
+  }
+
+  /** Jump straight to a look, no fade — used by Reset. */
+  snapTo(target: FixtureOutput[]) {
+    this.cur = snapshot(target);
+    this.from = snapshot(target);
+    this.to = snapshot(target);
+    this.duration = 1;
+    this.startedAt = 0;
+  }
+
+  step(now: number): Frame {
+    const p = Math.min(1, Math.max(0, (now - this.startedAt) / this.duration));
+    this.cur = this.from.map((f, i) => {
+      const t = this.to[i];
+      return {
+        intensity: f.intensity + (t.intensity - f.intensity) * p,
+        rgb: [
+          Math.round(f.rgb[0] + (t.rgb[0] - f.rgb[0]) * p),
+          Math.round(f.rgb[1] + (t.rgb[1] - f.rgb[1]) * p),
+          Math.round(f.rgb[2] + (t.rgb[2] - f.rgb[2]) * p),
+        ] as [number, number, number],
+      };
+    });
+    return this.cur;
+  }
+
+  progress(now: number): number {
+    return Math.min(1, Math.max(0, (now - this.startedAt) / this.duration));
+  }
+}
+
+/** A one-dimensional fade, for the blackout multiplier. */
+export class LevelFader {
+  private from: number;
+  private to: number;
+  private cur: number;
+  private startedAt = 0;
+  private duration = 1;
+
+  constructor(initial: number) {
+    this.cur = this.from = this.to = initial;
+  }
+
+  setTarget(value: number, durationMs: number, now: number) {
+    this.from = this.cur;
+    this.to = value;
+    this.startedAt = now;
+    this.duration = Math.max(durationMs, 1);
+  }
+
+  step(now: number): number {
+    const p = Math.min(1, Math.max(0, (now - this.startedAt) / this.duration));
+    this.cur = this.from + (this.to - this.from) * p;
+    return this.cur;
+  }
+
+  get value() {
+    return this.cur;
+  }
+}
+
+/** Pack an interpolated frame into a universe. */
+export function frameToUniverse(frame: Frame, master: number): Uint8Array {
+  const dmx = new Uint8Array(512);
+  RIG.forEach((fixture, i) => {
+    const f = frame[i];
+    if (!f) return;
+    const base = fixture.patch - 1;
+    dmx[base] = Math.round(f.intensity * master * 255);
+    if (fixture.kind !== "profile") {
+      dmx[base + 1] = f.rgb[0];
+      dmx[base + 2] = f.rgb[1];
+      dmx[base + 3] = f.rgb[2];
+    }
+  });
+  return dmx;
+}
