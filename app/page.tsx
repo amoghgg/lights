@@ -575,13 +575,21 @@ export default function Page() {
           </section>
 
           <section className="panel p-3">
-            <div className="flex items-center justify-between mb-2.5">
-              <span className="eyebrow">Output</span>
-              <span className="font-mono text-[10px] text-plot-dim">
-                {lighting.blackout ? "blackout" : lighting.look === "none" ? "open white" : lighting.look} ·{" "}
-                {gel.gel}
-                {lastFade && <span className="text-tungsten"> · {(lastFade / 1000).toFixed(1)}s count</span>}
-              </span>
+            <div className="flex items-center justify-between mb-2.5 gap-3">
+              <span className="eyebrow shrink-0">Output</span>
+              {lighting.blackout ? (
+                <span
+                  className="font-mono text-[10px] tracking-cue uppercase px-2 py-0.5 shrink-0"
+                  style={{ background: "#E0457B", color: "#08080A" }}
+                >
+                  ● Blackout — clap twice to bring it back
+                </span>
+              ) : (
+                <span className="font-mono text-[10px] text-plot-dim truncate">
+                  {lighting.look === "none" ? "open white" : lighting.look} · {gel.gel}
+                  {lastFade ? <span className="text-tungsten"> · {(lastFade / 1000).toFixed(1)}s count</span> : null}
+                </span>
+              )}
             </div>
             <StageView blackout={lighting.blackout} />
 

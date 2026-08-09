@@ -110,9 +110,16 @@ const DIM_MIN_FINGERS = 3;
 const DIM_SMOOTHING = 0.4;
 
 const SWIPE_WINDOW = 350; // ms
-const SWIPE_TRAVEL = 0.22; // normalised frame widths
-const SWIPE_MIN_SAMPLES = 3; // frames — low, so a dropped frame does not kill it
-const SWIPE_COOLDOWN = 900; // ms
+const SWIPE_TRAVEL = 0.3; // normalised frame widths
+const SWIPE_MIN_SAMPLES = 4; // frames
+const SWIPE_COOLDOWN = 1500; // ms
+/**
+ * A clap throws both hands sideways through the frame, and the moment the pair
+ * merges the tracker reports one hand travelling fast — which is exactly what a
+ * swipe looks like. Swiping is one-handed by definition, so anything within
+ * this window of seeing two hands cannot be a swipe.
+ */
+const SWIPE_TWO_HAND_LOCKOUT = 800; // ms
 
 const GLOBAL_COOLDOWN = 350; // ms after any discrete cue
 
@@ -123,7 +130,16 @@ const GLOBAL_COOLDOWN = 350; // ms after any discrete cue
  */
 const HAND_COUNT_DEBOUNCE = 110; // ms
 
-type Sample = { t: number; sep: number; x: number };
+/**
+ * Two separate histories, deliberately.
+ *
+ * They used to share one buffer, so two-handed motion fed the swipe detector —
+ * every clap wrote a fast lateral track and fired a colour cue. Worse, the
+ * colour cue then held the global cooldown open, which swallowed the very claps
+ * that produced it. Keeping the buffers apart is what makes the clap reliable.
+ */
+type SepSample = { t: number; sep: number };
+type XSample = { t: number; x: number };
 
 /**
  * Per-cue condition readout. A cue fires only when every condition passes, so
@@ -148,7 +164,9 @@ export type EngineState = {
 };
 
 export class GestureEngine {
-  private history: Sample[] = [];
+  private sepHistory: SepSample[] = [];
+  private xHistory: XSample[] = [];
+  private lastTwoHandAt = 0;
 
   // clap
   private clapArmed = true;
@@ -188,7 +206,8 @@ export class GestureEngine {
   };
 
   reset() {
-    this.history = [];
+    this.sepHistory = [];
+    this.xHistory = [];
     this.coverSince = 0;
     this.pointSince = 0;
     this.coverLatched = false;
@@ -218,8 +237,16 @@ export class GestureEngine {
 
     const cooling = t - this.lastCueAt < GLOBAL_COOLDOWN;
 
+    if (hands.length === 2) this.lastTwoHandAt = t;
+    // A single hand is the only thing that can be swiping, so the swipe track is
+    // discarded the moment the hand count is anything else.
+    if (hands.length !== 1) this.xHistory = [];
+
     // --- clap, on the raw hand count ----------------------------------------
-    if (this.detectClap(hands, t) && !cooling) {
+    // Deliberately outside the global cooldown. Pairing and re-arming already
+    // stop it running away, and gating it here meant any other cue could eat a
+    // clap silently — which is how the blackout came to feel broken.
+    if (this.detectClap(hands, t)) {
       const gap = t - this.lastClapAt;
       if (this.lastClapAt && gap > CLAP_MIN_GAP && gap < CLAP_MAX_GAP) {
         fired.push("blackout");
@@ -310,7 +337,7 @@ export class GestureEngine {
     // --- single hand ---------------------------------------------------------
     const hand = hands[0];
     const centre = palmCenter(hand);
-    this.history.push({ t, sep: NaN, x: centre.x });
+    this.xHistory.push({ t, x: centre.x });
     this.trimHistory(t);
     this.coverSince = 0;
     this.coverLatched = false;
@@ -328,6 +355,7 @@ export class GestureEngine {
     const f0 = extendedFingers(hand);
     const pointing = isPointing(hand);
     const swipeTravel = this.swipeTravel(t);
+    const swipeLocked = t - this.lastTwoHandAt < SWIPE_TWO_HAND_LOCKOUT;
 
     check("special", "index out, others curled", pointing, pointing ? "ok" : `${f0.count} fingers extended`);
     check("special", "hand still", travel < POINT_STILLNESS, `travel ${travel.toFixed(3)}, need < ${POINT_STILLNESS}`);
@@ -338,8 +366,9 @@ export class GestureEngine {
       Math.abs(swipeTravel) > SWIPE_TRAVEL,
       `moved ${Math.abs(swipeTravel).toFixed(2)}, need > ${SWIPE_TRAVEL} in ${SWIPE_WINDOW}ms`,
     );
+    check("colour", "one hand only", !swipeLocked, swipeLocked ? "second hand seen just now" : "ok");
 
-    if (this.detectSwipe(t) && !cooling && t - this.lastSwipeAt > SWIPE_COOLDOWN) {
+    if (!swipeLocked && this.detectSwipe(t) && !cooling && t - this.lastSwipeAt > SWIPE_COOLDOWN) {
       fired.push("colour");
       this.lastSwipeAt = t;
       this.lastCueAt = t;
@@ -398,10 +427,10 @@ export class GestureEngine {
 
     if (hands.length === 2) {
       const sep = palmSeparation(hands[0], hands[1]);
-      this.history.push({ t, sep, x: palmCenter(hands[0]).x });
+      this.sepHistory.push({ t, sep });
       this.trimHistory(t);
 
-      const prior = this.history.filter((s) => t - s.t > 25 && t - s.t < 220 && !Number.isNaN(s.sep));
+      const prior = this.sepHistory.filter((s) => t - s.t > 25 && t - s.t < 220);
       const speed = prior.length
         ? (prior[0].sep - sep) / Math.max((t - prior[0].t) / 1000, 1e-3)
         : 0;
@@ -438,13 +467,13 @@ export class GestureEngine {
 
   /** Net sideways travel over the swipe window, signed. Read-only — for the readout. */
   private swipeTravel(t: number): number {
-    const win = this.history.filter((s) => t - s.t <= SWIPE_WINDOW);
+    const win = this.xHistory.filter((s) => t - s.t <= SWIPE_WINDOW);
     if (win.length < SWIPE_MIN_SAMPLES) return 0;
     return win[win.length - 1].x - win[0].x;
   }
 
   private detectSwipe(t: number): boolean {
-    const win = this.history.filter((s) => t - s.t <= SWIPE_WINDOW);
+    const win = this.xHistory.filter((s) => t - s.t <= SWIPE_WINDOW);
     if (win.length < SWIPE_MIN_SAMPLES) return false;
     const dx = win[win.length - 1].x - win[0].x;
     if (Math.abs(dx) < SWIPE_TRAVEL) return false;
@@ -460,7 +489,8 @@ export class GestureEngine {
 
   private trimHistory(t: number) {
     const cutoff = t - 1200;
-    while (this.history.length && this.history[0].t < cutoff) this.history.shift();
+    while (this.sepHistory.length && this.sepHistory[0].t < cutoff) this.sepHistory.shift();
+    while (this.xHistory.length && this.xHistory[0].t < cutoff) this.xHistory.shift();
   }
 
   private clearHolds() {
