@@ -369,6 +369,23 @@ export default function Page() {
               </span>
             </div>
             <StageView outputs={outputs} blackout={lighting.blackout} />
+
+            {/* Master, as a fader — the only way to see a continuous cue tracking. */}
+            <div className="mt-3 flex items-center gap-3">
+              <span className="font-mono text-[9px] tracking-cue uppercase text-plot-faint shrink-0">Master</span>
+              <div className="relative flex-1 h-1.5 bg-house overflow-hidden">
+                <div
+                  className="absolute inset-y-0 left-0 bg-tungsten"
+                  style={{
+                    width: `${(lighting.blackout ? 0 : lighting.master) * 100}%`,
+                    transition: "width 60ms linear",
+                  }}
+                />
+              </div>
+              <span className="font-mono text-[10px] tnum text-plot w-9 text-right shrink-0">
+                {Math.round((lighting.blackout ? 0 : lighting.master) * 100)}%
+              </span>
+            </div>
           </section>
         </div>
 

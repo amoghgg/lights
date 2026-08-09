@@ -68,7 +68,7 @@ export const CUES: {
     id: "dim",
     n: "LX 4",
     name: "Master dim",
-    gesture: "Flat palm, move up or down",
+    gesture: "One open hand, move up or down",
     kind: "continuous",
     hands: 1,
     falseTriggerRisk: "medium",
@@ -100,11 +100,13 @@ const COVER_RAISED_Y = 0.62;
 const POINT_HOLD = 500; // ms
 const POINT_STILLNESS = 0.035; // max palm travel per frame while "held"
 
-// A palm held flat and facing down is heavily foreshortened from a front-facing
-// webcam, so both the flatness bar and the finger count have to be forgiving.
-const DIM_FLATNESS = 0.32;
+// Any open hand drives the master — orientation is not tested at all. Asking an
+// operator to hold a specific palm angle while also watching the stage was a
+// design mistake: the gesture has to survive being performed without looking.
 const DIM_MIN_FINGERS = 3;
-const DIM_SMOOTHING = 0.25; // EMA on the output level
+// EMA on the output level. High enough to feel immediate, low enough that
+// landmark jitter does not read as flicker on stage.
+const DIM_SMOOTHING = 0.4;
 
 const SWIPE_WINDOW = 350; // ms
 const SWIPE_TRAVEL = 0.22; // normalised frame widths
@@ -291,7 +293,6 @@ export class GestureEngine {
     check("special", "index out, others curled", pointing, pointing ? "ok" : `${f0.count} fingers extended`);
     check("special", "hand still", travel < POINT_STILLNESS, `travel ${travel.toFixed(3)}, need < ${POINT_STILLNESS}`);
     check("dim", "palm open", f0.count >= DIM_MIN_FINGERS, `${f0.count} fingers, need ${DIM_MIN_FINGERS}+`);
-    check("dim", "palm flat", flat > DIM_FLATNESS, `flatness ${flat.toFixed(2)}, need > ${DIM_FLATNESS}`);
     check(
       "colour",
       "sideways travel",
@@ -329,8 +330,8 @@ export class GestureEngine {
     this.pointSince = 0;
     this.pointLatched = false;
 
-    // cue 4 — flat palm drives the master, continuously
-    if (f0.count >= DIM_MIN_FINGERS && flat > DIM_FLATNESS) {
+    // cue 4 — an open hand drives the master, continuously, wherever it points
+    if (f0.count >= DIM_MIN_FINGERS) {
       // wrist near the top of frame is full, near the bottom is out
       const raw = 1 - Math.min(1, Math.max(0, (centre.y - 0.15) / 0.7));
       this.dimEma = this.dimEma === null ? raw : this.dimEma + (raw - this.dimEma) * DIM_SMOOTHING;

@@ -59,10 +59,17 @@ export const INITIAL_STATE: LightingState = {
   colour: 0,
 };
 
+/** Below this the rig reads as off, so coming out of a blackout has to clear it. */
+const VISIBLE_FLOOR = 0.15;
+
 export function applyCue(s: LightingState, cue: CueId, dimLevel?: number | null): LightingState {
   switch (cue) {
     case "blackout":
-      return { ...s, blackout: !s.blackout };
+      // Clapping back in must always put light on stage. If the master was left
+      // low, restoring the previous value would clap into another blackout.
+      return s.blackout
+        ? { ...s, blackout: false, master: s.master < VISIBLE_FLOOR ? INITIAL_STATE.master : s.master }
+        : { ...s, blackout: true };
     case "cover":
       return { ...s, blackout: false, look: "cover" };
     case "special":
@@ -92,11 +99,16 @@ export function resolve(s: LightingState): FixtureOutput[] {
     let rgb: readonly [number, number, number] = TUNGSTEN;
 
     if (fixture.kind === "wash") {
-      intensity = s.look === "special" ? 0.08 : s.look === "cover" ? 1 : 0.45;
+      // Open white sits high, not half-up: the master is what takes the rig
+      // from black to full, so the base state has to leave room to read as
+      // "full" when a hand goes all the way up.
+      intensity = s.look === "special" ? 0.08 : s.look === "cover" ? 1 : 0.85;
     } else if (fixture.kind === "profile") {
       intensity = s.look === "special" ? 1 : 0;
     } else {
-      intensity = s.look === "special" ? 0 : s.look === "cover" ? 0.55 : 0.35;
+      // Backlight never goes fully out, even under a special — it is the only
+      // fixture carrying colour, and a colour cue you cannot see is not a cue.
+      intensity = s.look === "special" ? 0.2 : s.look === "cover" ? 0.55 : 0.5;
       rgb = colour;
     }
 

@@ -29,6 +29,9 @@ export default function StageView({ outputs, blackout }: { outputs: FixtureOutpu
     <svg
       viewBox={`0 0 ${W} ${H}`}
       className="w-full h-auto"
+      // `screen` needs its own stacking context, or the pools blend with the
+      // page behind the SVG instead of with each other.
+      style={{ isolation: "isolate" }}
       role="img"
       aria-label="Plan view of the lighting rig showing which fixtures are lit"
     >
