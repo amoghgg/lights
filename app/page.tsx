@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HandLandmarker } from "@mediapipe/tasks-vision";
 import CueRail from "@/components/CueRail";
+import Diagnostics from "@/components/Diagnostics";
 import EventLog from "@/components/EventLog";
 import StageView from "@/components/StageView";
 import Telemetry, { type Timing } from "@/components/Telemetry";
@@ -21,6 +22,7 @@ const REST: EngineState = {
   dimLevel: null,
   separation: null,
   flatness: null,
+  checks: [],
 };
 
 export default function Page() {
@@ -42,6 +44,7 @@ export default function Page() {
   const [lastFired, setLastFired] = useState<{ cue: CueId; at: number } | null>(null);
   const [startedAt, setStartedAt] = useState(0);
   const [elapsed, setElapsed] = useState(0);
+  const [delegate, setDelegate] = useState<"GPU" | "CPU">("GPU");
 
   const outputs = resolve(lighting);
   const dmx = toUniverse(outputs);
@@ -81,14 +84,28 @@ export default function Page() {
     try {
       const { FilesetResolver, HandLandmarker } = await import("@mediapipe/tasks-vision");
       const vision = await FilesetResolver.forVisionTasks("/mediapipe/wasm");
-      landmarkerRef.current = await HandLandmarker.createFromOptions(vision, {
-        baseOptions: { modelAssetPath: "/mediapipe/hand_landmarker.task", delegate: "GPU" },
-        runningMode: "VIDEO",
+      const options = {
+        runningMode: "VIDEO" as const,
         numHands: 2,
         minHandDetectionConfidence: 0.5,
         minHandPresenceConfidence: 0.5,
         minTrackingConfidence: 0.5,
-      });
+      };
+      // GPU is faster where WebGL cooperates; plenty of machines and browsers
+      // refuse it, and falling back beats failing to start.
+      try {
+        landmarkerRef.current = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: "/mediapipe/hand_landmarker.task", delegate: "GPU" },
+          ...options,
+        });
+        setDelegate("GPU");
+      } catch {
+        landmarkerRef.current = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: "/mediapipe/hand_landmarker.task", delegate: "CPU" },
+          ...options,
+        });
+        setDelegate("CPU");
+      }
 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
@@ -252,7 +269,7 @@ export default function Page() {
             {phase === "running" && (
               <>
                 <span className="font-mono text-[10px] tnum text-plot-dim hidden md:block">
-                  {timing.fps.toFixed(0)} fps · {timing.total.toFixed(0)} ms
+                  {timing.fps.toFixed(0)} fps · {timing.total.toFixed(0)} ms · {delegate}
                 </span>
                 <button
                   onClick={resetRig}
@@ -328,10 +345,16 @@ export default function Page() {
               )}
 
               {phase === "running" && !armed && (
-                <div className="absolute bottom-2 left-2 right-2 px-2 py-1.5 bg-house/85 border border-house-edge">
-                  <p className="font-mono text-[10px] text-plot-dim">
+                <div className="absolute bottom-2 left-2 right-2 flex items-center gap-3 px-3 py-2 bg-house/95 border border-tungsten/50">
+                  <p className="font-mono text-[10px] text-tungsten leading-snug flex-1">
                     Tracking, but cues will not fire. Arm the system to take the rig live.
                   </p>
+                  <button
+                    onClick={() => setArmed(true)}
+                    className="font-mono text-[10px] tracking-cue uppercase px-3 py-1.5 border border-tungsten text-tungsten hover:bg-tungsten/15 transition-colors shrink-0"
+                  >
+                    Arm
+                  </button>
                 </div>
               )}
             </div>
@@ -351,7 +374,12 @@ export default function Page() {
 
         <CueRail state={engineState} lastFired={lastFired} />
 
-        <div className="grid lg:grid-cols-[1fr_260px_1fr] gap-4">
+        <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-4">
+          <section className="panel p-3">
+            <div className="eyebrow mb-2.5">Why a cue is not firing</div>
+            <Diagnostics state={engineState} />
+          </section>
+
           <section className="panel p-3">
             <div className="eyebrow mb-2.5">DMX universe</div>
             <Universe dmx={dmx} />

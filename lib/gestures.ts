@@ -93,12 +93,17 @@ const CLAP_MIN_GAP = 120; // ms — below this it is one clap seen twice
 const CLAP_MAX_GAP = 800; // ms — above this it is two separate claps
 
 const COVER_HOLD = 400; // ms
-const COVER_RAISED_Y = 0.55; // wrists must sit in the upper part of frame
+// Wrists must sit above this line. Generous, because a seated operator at a
+// laptop frames head-and-shoulders — hands never get near the top of frame.
+const COVER_RAISED_Y = 0.62;
 
 const POINT_HOLD = 500; // ms
 const POINT_STILLNESS = 0.035; // max palm travel per frame while "held"
 
-const DIM_FLATNESS = 0.55;
+// A palm held flat and facing down is heavily foreshortened from a front-facing
+// webcam, so both the flatness bar and the finger count have to be forgiving.
+const DIM_FLATNESS = 0.32;
+const DIM_MIN_FINGERS = 3;
 const DIM_SMOOTHING = 0.25; // EMA on the output level
 
 const SWIPE_WINDOW = 350; // ms
@@ -108,6 +113,13 @@ const SWIPE_COOLDOWN = 900; // ms
 const GLOBAL_COOLDOWN = 450; // ms after any discrete cue
 
 type Sample = { t: number; sep: number; x: number };
+
+/**
+ * Per-cue condition readout. A cue fires only when every condition passes, so
+ * showing them individually turns "nothing happened" into "my wrists were too
+ * low" without anyone having to open a console.
+ */
+export type Check = { cue: CueId; label: string; ok: boolean; detail: string };
 
 export type EngineState = {
   /** What the engine currently believes it is looking at. "rest" is the null class. */
@@ -121,6 +133,7 @@ export type EngineState = {
   /** Live diagnostics, surfaced in the telemetry panel. */
   separation: number | null;
   flatness: number | null;
+  checks: Check[];
 };
 
 export class GestureEngine {
@@ -147,6 +160,7 @@ export class GestureEngine {
     dimLevel: null,
     separation: null,
     flatness: null,
+    checks: [],
   };
 
   reset() {
@@ -171,6 +185,9 @@ export class GestureEngine {
     this.state.handCount = hands.length;
     this.state.separation = null;
     this.state.flatness = null;
+    this.state.checks = [];
+    const check = (cue: CueId, label: string, ok: boolean, detail: string) =>
+      this.state.checks.push({ cue, label, ok, detail });
 
     if (hands.length === 0) {
       this.clearHolds();
@@ -178,6 +195,7 @@ export class GestureEngine {
       this.state.hold = 0;
       this.state.dimLevel = null;
       this.dimEma = null;
+      check("blackout", "hand visible", false, "no hand in frame");
       return { fired, dimLevel };
     }
 
@@ -208,7 +226,21 @@ export class GestureEngine {
 
       // cue 2 — both palms open and raised
       const bothOpen = isOpenPalm(a) && isOpenPalm(b);
-      const bothRaised = a[0].y < COVER_RAISED_Y && b[0].y < COVER_RAISED_Y;
+      const lowerWrist = Math.max(a[0].y, b[0].y);
+      const bothRaised = lowerWrist < COVER_RAISED_Y;
+
+      check("blackout", "two hands", true, "ok");
+      check("blackout", "armed (palms apart)", this.clapArmed, `sep ${sep.toFixed(2)} span`);
+      check("blackout", "palms together", sep < CLAP_TOGETHER, `need < ${CLAP_TOGETHER}, at ${sep.toFixed(2)}`);
+      check(
+        "cover",
+        "both palms open",
+        bothOpen,
+        bothOpen ? "ok" : `${[isOpenPalm(a), isOpenPalm(b)].filter(Boolean).length}/2 open`,
+      );
+      check("cover", "wrists raised", bothRaised, `lower wrist at y ${lowerWrist.toFixed(2)}, need < ${COVER_RAISED_Y}`);
+      check("cover", "hands apart", sep > CLAP_APART, `sep ${sep.toFixed(2)}, need > ${CLAP_APART}`);
+
       if (bothOpen && bothRaised && sep > CLAP_APART) {
         if (!this.coverSince) this.coverSince = t;
         const held = t - this.coverSince;
@@ -252,6 +284,21 @@ export class GestureEngine {
     const flat = palmFlatness(hand);
     this.state.flatness = flat;
 
+    const f0 = extendedFingers(hand);
+    const pointing = isPointing(hand);
+    const swipeTravel = this.swipeTravel(t);
+
+    check("special", "index out, others curled", pointing, pointing ? "ok" : `${f0.count} fingers extended`);
+    check("special", "hand still", travel < POINT_STILLNESS, `travel ${travel.toFixed(3)}, need < ${POINT_STILLNESS}`);
+    check("dim", "palm open", f0.count >= DIM_MIN_FINGERS, `${f0.count} fingers, need ${DIM_MIN_FINGERS}+`);
+    check("dim", "palm flat", flat > DIM_FLATNESS, `flatness ${flat.toFixed(2)}, need > ${DIM_FLATNESS}`);
+    check(
+      "colour",
+      "sideways travel",
+      Math.abs(swipeTravel) > SWIPE_TRAVEL,
+      `moved ${Math.abs(swipeTravel).toFixed(2)}, need > ${SWIPE_TRAVEL} in ${SWIPE_WINDOW}ms`,
+    );
+
     // cue 5 — lateral swipe. Checked before the static cues because a hand in
     // motion is never a held pose.
     const swipe = this.detectSwipe(t);
@@ -283,8 +330,7 @@ export class GestureEngine {
     this.pointLatched = false;
 
     // cue 4 — flat palm drives the master, continuously
-    const f = extendedFingers(hand);
-    if (f.count === 4 && flat > DIM_FLATNESS) {
+    if (f0.count >= DIM_MIN_FINGERS && flat > DIM_FLATNESS) {
       // wrist near the top of frame is full, near the bottom is out
       const raw = 1 - Math.min(1, Math.max(0, (centre.y - 0.15) / 0.7));
       this.dimEma = this.dimEma === null ? raw : this.dimEma + (raw - this.dimEma) * DIM_SMOOTHING;
@@ -320,6 +366,13 @@ export class GestureEngine {
 
     this.clapArmed = false;
     return true;
+  }
+
+  /** Net sideways travel over the swipe window, signed. Read-only — for the readout. */
+  private swipeTravel(t: number): number {
+    const win = this.history.filter((s) => t - s.t <= SWIPE_WINDOW);
+    if (win.length < 4) return 0;
+    return win[win.length - 1].x - win[0].x;
   }
 
   private detectSwipe(t: number): boolean {
