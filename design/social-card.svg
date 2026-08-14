@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <!--
+    Social card. 2:1, which is what Twitter's large card wants and what GitHub's
+    social preview is sized for, so one image serves both.
+
+    The composition is the subject rather than a logo on a gradient: a bar of
+    fixtures across the top, beams raking down, and the title sitting in the
+    light they cast. Beams composite with screen because that is what
+    overlapping light does.
+  -->
+  <defs>
+    <linearGradient id="b1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFC46B" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#FFA53D" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="b2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFA53D" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="#FFA53D" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="b3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4D8FD6" stop-opacity="0.26"/>
+      <stop offset="100%" stop-color="#4D8FD6" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="b4" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#E0457B" stop-opacity="0.20"/>
+      <stop offset="100%" stop-color="#E0457B" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="pool" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFC46B" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#FFA53D" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="#08080A"/>
+
+  <!-- the beams, raking down and outward -->
+  <g style="mix-blend-mode:screen">
+    <path d="M232 64 H288 L420 560 H60 Z"    fill="url(#b1)"/>
+    <path d="M472 64 H528 L700 560 H300 Z"   fill="url(#b2)"/>
+    <path d="M752 64 H808 L1010 560 H600 Z"  fill="url(#b3)"/>
+    <path d="M1000 64 H1056 L1260 560 H880 Z" fill="url(#b4)"/>
+    <ellipse cx="300" cy="556" rx="330" ry="60" fill="url(#pool)"/>
+  </g>
+
+  <!-- the bar, and the fixtures hung off it -->
+  <rect x="0" y="44" width="1280" height="6" fill="#1C1C22"/>
+  <g fill="#FFC46B">
+    <rect x="234" y="50" width="52" height="16" rx="3"/>
+    <rect x="474" y="50" width="52" height="16" rx="3" fill="#FFA53D"/>
+    <rect x="754" y="50" width="52" height="16" rx="3" fill="#4D8FD6"/>
+    <rect x="1002" y="50" width="52" height="16" rx="3" fill="#E0457B"/>
+  </g>
+
+  <!-- title, sitting in the light -->
+  <text x="80" y="392" font-family="LightsDisplay"
+        font-size="228" letter-spacing="2" fill="#E8E4DC">LIGHTS</text>
+
+  <text x="86" y="452" font-family="Menlo, monospace" font-size="27"
+        letter-spacing="0.5" fill="#B9B4AA">Five hand gestures run a theatrical lighting rig</text>
+
+  <text x="86" y="500" font-family="Menlo, monospace" font-size="21"
+        letter-spacing="1.2" fill="#6E6E77">Markerless · CPU-only · real DMX512 out</text>
+
+  <text x="86" y="580" font-family="Menlo, monospace" font-size="22"
+        letter-spacing="1.4" fill="#FFA53D">lights.amoghbajpai.com</text>
+</svg>
