@@ -2,7 +2,7 @@
   "name": "lights",
   "version": "0.1.0",
   "private": true,
-  "description": "Gesture-cued theatrical lighting control — five hand gestures drive a virtual DMX rig, in the browser.",
+  "description": "Gesture-cued theatrical lighting control \u2014 five hand gestures drive a virtual DMX rig, in the browser.",
   "homepage": "https://lights.amoghbajpai.com",
   "license": "MIT",
   "scripts": {
@@ -10,7 +10,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "thresholds:latex": "node --experimental-strip-types scripts-thresholds.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^0.10.18",

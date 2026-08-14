@@ -1,62 +1,111 @@
 /**
- * The rig, and the state the cues drive it into.
+ * Looks, fades, and the DMX universe they produce.
  *
- * Seven fixtures, patched into a DMX universe exactly as they would be on a real
- * plot — four front wash, one centre profile, two colour backlight. The universe
- * is generated rather than decorative: swap the renderer for a sACN socket and
- * the same bytes drive real fixtures.
+ * A look is expressed as a level per rig *position* rather than per fixture,
+ * which is how a designer thinks and writes: "booms at 60, cyc at full, front
+ * of house out". Colour is assigned by position too, because the gel in a
+ * backlight and the gel in a cyc flood are different decisions.
  */
 
 import type { CueId } from "./gestures";
+import { CHANNELS, COLOUR_STATES, Fixture, GELS, Gel, Position, RIG } from "./rig";
 
-export type FixtureKind = "wash" | "profile" | "back";
+export { COLOUR_STATES, GELS, RIG } from "./rig";
+export { PATCHED_CHANNELS } from "./rig";
 
-export type Fixture = {
-  id: string;
-  /** Channel number as it would appear on the plot. */
-  patch: number;
-  kind: FixtureKind;
-  /** Position on the plan, 0..1 across the stage and 0..1 upstage. */
-  x: number;
-  y: number;
-  /** Beam half-angle, degrees — a profile is tight, a PAR is wide. */
-  beam: number;
+export type LookId =
+  | "preset"
+  | "cover"
+  | "special"
+  | "gobo"
+  | "cyconly"
+  | "sidelight"
+  | "silhouette"
+  | "footlights";
+
+export type LookDef = {
+  id: LookId;
+  name: string;
+  note: string;
+  levels: Partial<Record<Position, number>>;
+  /** Breakup gobos in the beam — texture rather than flat wash. */
+  gobo?: boolean;
 };
 
-export const RIG: Fixture[] = [
-  { id: "FOH 1", patch: 1, kind: "wash", x: 0.16, y: 0.06, beam: 30 },
-  { id: "FOH 2", patch: 5, kind: "wash", x: 0.38, y: 0.06, beam: 30 },
-  { id: "FOH 3", patch: 9, kind: "wash", x: 0.62, y: 0.06, beam: 30 },
-  { id: "FOH 4", patch: 13, kind: "wash", x: 0.84, y: 0.06, beam: 30 },
-  { id: "PROFILE", patch: 17, kind: "profile", x: 0.5, y: 0.3, beam: 12 },
-  { id: "BACK L", patch: 18, kind: "back", x: 0.32, y: 0.92, beam: 34 },
-  { id: "BACK R", patch: 22, kind: "back", x: 0.68, y: 0.92, beam: 34 },
+/**
+ * The look library. The five gestures reach three of these; the rest exist so
+ * the whole rig can be inspected without performing a cue, which is what makes
+ * this usable as a demonstration piece rather than only as a controller.
+ */
+export const LOOKS: LookDef[] = [
+  {
+    id: "preset",
+    name: "Preset",
+    note: "House half, stage warm. What the audience walks into.",
+    levels: { foh: 0.35, overhead: 0.3, cyc: 0.3, back: 0.15, house: 0.55 },
+  },
+  {
+    id: "cover",
+    name: "General cover",
+    note: "Everyone visible, everywhere. The workhorse state.",
+    levels: { foh: 1, overhead: 0.9, back: 0.55, "boom-sl": 0.4, "boom-sr": 0.4, cyc: 0.5, foot: 0.2 },
+  },
+  {
+    id: "special",
+    name: "Centre special",
+    note: "One performer isolated. Everything else falls away.",
+    levels: { spot: 1, back: 0.2, cyc: 0.1, foh: 0.05 },
+  },
+  {
+    id: "gobo",
+    name: "Breakup",
+    note: "Textured light — dappled leaves across the cyc.",
+    levels: { gobo: 1, cyc: 0.45, back: 0.35, foh: 0.25, overhead: 0.2 },
+    gobo: true,
+  },
+  {
+    id: "cyconly",
+    name: "Cyc wash",
+    note: "The back wall alone, saturated. Colour as the whole statement.",
+    levels: { cyc: 1, back: 0.15 },
+  },
+  {
+    id: "sidelight",
+    name: "Sidelight",
+    note: "Booms only. The dance position — bodies modelled, floor dark.",
+    levels: { "boom-sl": 1, "boom-sr": 1, cyc: 0.2 },
+  },
+  {
+    id: "silhouette",
+    name: "Silhouette",
+    note: "Cyc up, everything front out. Shapes against colour.",
+    levels: { cyc: 1, back: 0.75 },
+  },
+  {
+    id: "footlights",
+    name: "Footlights",
+    note: "Lit from below. Period, and faintly sinister.",
+    levels: { foot: 1, cyc: 0.35, back: 0.2 },
+  },
 ];
 
-/** Gel references, so the colour states name themselves the way a plot would. */
-export const COLOUR_STATES = [
-  { gel: "L201", name: "Full CT Blue", rgb: [77, 143, 214] as const },
-  { gel: "L106", name: "Primary Red", rgb: [214, 58, 62] as const },
-  { gel: "L104", name: "Deep Amber", rgb: [255, 146, 45] as const },
-  { gel: "L124", name: "Dark Green", rgb: [64, 176, 116] as const },
-  { gel: "L126", name: "Mauve", rgb: [176, 92, 196] as const },
-];
-
-/** 3200K tungsten — what an untinted theatre front wash actually looks like. */
-const TUNGSTEN = [255, 187, 122] as const;
+export const LOOK = (id: LookId) => LOOKS.find((l) => l.id === id)!;
 
 export type LightingState = {
   blackout: boolean;
-  look: "cover" | "special" | "none";
+  look: LookId;
   master: number; // 0..1
   colour: number; // index into COLOUR_STATES
+  /** Movers swung out to the extremes, or parked centre. */
+  moversOut: boolean;
 };
 
 export const INITIAL_STATE: LightingState = {
   blackout: false,
-  look: "none",
+  look: "preset",
   master: 0.8,
   colour: 0,
+  moversOut: false,
 };
 
 /** Below this the rig reads as off, so coming out of a blackout has to clear it. */
@@ -75,7 +124,7 @@ export function applyCue(s: LightingState, cue: CueId, dimLevel?: number | null)
     case "special":
       return { ...s, blackout: false, look: "special" };
     case "colour":
-      return { ...s, colour: (s.colour + 1) % COLOUR_STATES.length };
+      return { ...s, colour: (s.colour + 1) % COLOUR_STATES.length, moversOut: !s.moversOut };
     case "dim":
       return { ...s, master: dimLevel ?? s.master };
     default:
@@ -85,9 +134,40 @@ export function applyCue(s: LightingState, cue: CueId, dimLevel?: number | null)
 
 export type FixtureOutput = {
   fixture: Fixture;
-  intensity: number; // 0..1
+  intensity: number; // 0..1, before master
   rgb: readonly [number, number, number];
+  /** Moving-head orientation, -1..1 across the stage. */
+  pan: number;
 };
+
+/** Which gel a position carries, given the current colour state. */
+function gelFor(f: Fixture, colour: number): Gel {
+  const c = COLOUR_STATES[colour];
+  switch (f.position) {
+    case "foh":
+      // warm outside, cool inside — the standard two-colour front wash
+      return f.id === "FOH-1" || f.id === "FOH-4" ? GELS.tungsten : GELS.L202;
+    case "overhead":
+      return GELS.openWhite;
+    case "boom-sl":
+    case "boom-sr":
+      return c.back;
+    case "back":
+      return c.back;
+    case "cyc":
+      return c.cyc;
+    case "gobo":
+      return GELS.L147;
+    case "mover":
+      return c.cyc;
+    case "spot":
+      return GELS.openWhite;
+    case "foot":
+      return GELS.tungsten;
+    case "house":
+      return GELS.tungsten;
+  }
+}
 
 /**
  * Resolve the abstract state into a per-fixture output — *before* the master.
@@ -98,48 +178,32 @@ export type FixtureOutput = {
  * a CSS variable the render loop writes directly.
  */
 export function resolve(s: LightingState): FixtureOutput[] {
-  const colour = COLOUR_STATES[s.colour].rgb;
-
+  const look = LOOK(s.look);
   return RIG.map((fixture) => {
-    let intensity = 0;
-    let rgb: readonly [number, number, number] = TUNGSTEN;
+    let intensity = look.levels[fixture.position] ?? 0;
 
-    if (fixture.kind === "wash") {
-      // Open white sits high, not half-up: the master is what takes the rig
-      // from black to full, so the base state has to leave room to read as
-      // "full" when a hand goes all the way up.
-      intensity = s.look === "special" ? 0.08 : s.look === "cover" ? 1 : 0.85;
-    } else if (fixture.kind === "profile") {
-      intensity = s.look === "special" ? 1 : 0;
-    } else {
-      // Backlight never goes fully out, even under a special — it is the only
-      // fixture carrying colour, and a colour cue you cannot see is not a cue.
-      intensity = s.look === "special" ? 0.2 : s.look === "cover" ? 0.55 : 0.5;
-      rgb = colour;
-    }
+    // Booms are hung in threes; the shin bust works harder than the high one.
+    if (fixture.id.endsWith("3")) intensity *= 1.0;
+    if (fixture.id.endsWith("1") && fixture.position.startsWith("boom")) intensity *= 0.75;
 
-    return { fixture, intensity, rgb };
+    // The followspot only lives in looks that call for it.
+    if (fixture.position === "spot" && !look.levels.spot) intensity = 0;
+
+    // Movers follow the colour cue rather than a level cue.
+    if (fixture.position === "mover") intensity = look.levels.cyc ? 0.7 : 0.35;
+
+    return {
+      fixture,
+      intensity,
+      rgb: gelFor(fixture, s.colour).rgb,
+      pan: fixture.position === "mover" ? (s.moversOut ? (fixture.x < 0.5 ? -1 : 1) : 0) : 0,
+    };
   });
 }
 
-/** Pack the resolved rig into a real 512-channel universe, master applied. */
-export function toUniverse(outputs: FixtureOutput[], master: number): Uint8Array {
-  const dmx = new Uint8Array(512);
-  for (const { fixture, intensity, rgb } of outputs) {
-    const base = fixture.patch - 1;
-    const level = Math.round(intensity * master * 255);
-    dmx[base] = level;
-    if (fixture.kind !== "profile") {
-      dmx[base + 1] = rgb[0];
-      dmx[base + 2] = rgb[1];
-      dmx[base + 3] = rgb[2];
-    }
-  }
-  return dmx;
-}
+export const hasGobo = (s: LightingState) => Boolean(LOOK(s.look).gobo);
 
-/** Highest channel the rig touches — everything above is dead air on the plot. */
-export const PATCHED_CHANNELS = 25;
+// --- fades -------------------------------------------------------------------
 
 /**
  * Fade times, in milliseconds — the "count" a board operator would write on the
@@ -149,20 +213,20 @@ export const PATCHED_CHANNELS = 25;
  * The master is absent because it does not fade. It is the operator's hand, live.
  */
 export const FADE_MS: Record<CueId, number> = {
-  blackout: 1000, // going out — quick, but still a fade
-  cover: 3000, // a warm build to full
-  special: 2500, // wash out as the profile comes in
-  colour: 2000, // gels crossfade slowly or it reads as a glitch
-  dim: 0, // tracks the hand, never interpolated
+  blackout: 1000,
+  cover: 3000,
+  special: 2500,
+  colour: 2000,
+  dim: 0,
 };
 
 /** Coming back in is slower than going out — a stage that snaps on blinds people. */
 export const BLACKOUT_IN_MS = 1800;
 
-type Frame = { intensity: number; rgb: [number, number, number] }[];
+type Frame = { intensity: number; rgb: [number, number, number]; pan: number }[];
 
 const snapshot = (o: FixtureOutput[]): Frame =>
-  o.map((f) => ({ intensity: f.intensity, rgb: [f.rgb[0], f.rgb[1], f.rgb[2]] }));
+  o.map((f) => ({ intensity: f.intensity, rgb: [f.rgb[0], f.rgb[1], f.rgb[2]], pan: f.pan }));
 
 /**
  * Interpolates the rig from one look to the next over a cue's fade time.
@@ -185,7 +249,7 @@ export class RigFader {
   }
 
   setTarget(target: FixtureOutput[], durationMs: number, now: number) {
-    this.from = this.cur.map((f) => ({ intensity: f.intensity, rgb: [...f.rgb] as [number, number, number] }));
+    this.from = this.cur.map((f) => ({ ...f, rgb: [...f.rgb] as [number, number, number] }));
     this.to = snapshot(target);
     this.startedAt = now;
     this.duration = Math.max(durationMs, 1);
@@ -211,13 +275,10 @@ export class RigFader {
           Math.round(f.rgb[1] + (t.rgb[1] - f.rgb[1]) * p),
           Math.round(f.rgb[2] + (t.rgb[2] - f.rgb[2]) * p),
         ] as [number, number, number],
+        pan: f.pan + (t.pan - f.pan) * p,
       };
     });
     return this.cur;
-  }
-
-  progress(now: number): number {
-    return Math.min(1, Math.max(0, (now - this.startedAt) / this.duration));
   }
 }
 
@@ -251,18 +312,43 @@ export class LevelFader {
   }
 }
 
-/** Pack an interpolated frame into a universe. */
+/**
+ * Pack an interpolated frame into a universe, honouring each personality's real
+ * channel layout. This is the output that would go out over sACN.
+ */
 export function frameToUniverse(frame: Frame, master: number): Uint8Array {
   const dmx = new Uint8Array(512);
   RIG.forEach((fixture, i) => {
     const f = frame[i];
     if (!f) return;
-    const base = fixture.patch - 1;
-    dmx[base] = Math.round(f.intensity * master * 255);
-    if (fixture.kind !== "profile") {
-      dmx[base + 1] = f.rgb[0];
-      dmx[base + 2] = f.rgb[1];
-      dmx[base + 3] = f.rgb[2];
+    const b = fixture.patch - 1;
+    const level = Math.round(f.intensity * master * 255);
+
+    if (fixture.type === "moving") {
+      dmx[b] = Math.round((f.pan + 1) * 127.5); // pan
+      dmx[b + 1] = 128; // tilt, parked
+      dmx[b + 2] = level;
+      dmx[b + 3] = f.rgb[0];
+      dmx[b + 4] = f.rgb[1];
+      dmx[b + 5] = f.rgb[2];
+      dmx[b + 6] = 0; // gobo wheel
+      dmx[b + 7] = 0; // strobe
+      return;
+    }
+    if (fixture.type === "followspot") {
+      dmx[b] = level;
+      dmx[b + 1] = 200; // iris
+      return;
+    }
+    if (fixture.type === "house") {
+      dmx[b] = level;
+      return;
+    }
+    dmx[b] = level;
+    if (CHANNELS[fixture.type] >= 4) {
+      dmx[b + 1] = f.rgb[0];
+      dmx[b + 2] = f.rgb[1];
+      dmx[b + 3] = f.rgb[2];
     }
   });
   return dmx;

@@ -1,39 +1,72 @@
 "use client";
 
-import { PATCHED_CHANNELS } from "@/lib/lighting";
+import { CHANNELS, POSITION_LABEL, POSITION_ORDER, PATCHED_CHANNELS, RIG } from "@/lib/rig";
 
 /**
- * Live DMX readout. These are the real bytes the rig would receive — the same
- * array that would go out over sACN to physical fixtures. Shown because "it
- * produces a valid universe" is the claim that makes this more than an
- * animation.
+ * Live DMX readout, grouped the way a patch sheet groups it.
+ *
+ * A flat grid of 119 numbers is data, not information. Listing fixtures under
+ * their position, with the channel range and the level that is actually going
+ * out, is what lets you check the rig against the plot — and makes it obvious
+ * that this is real control data rather than an animation.
  */
 export default function Universe({ dmx }: { dmx: Uint8Array }) {
   return (
     <div>
-      <div className="grid grid-cols-[repeat(auto-fill,minmax(34px,1fr))] gap-px">
-        {Array.from({ length: PATCHED_CHANNELS }, (_, i) => {
-          const v = dmx[i];
-          const on = v > 0;
+      <div className="space-y-2.5">
+        {POSITION_ORDER.map((pos) => {
+          const fixtures = RIG.filter((f) => f.position === pos);
+          if (!fixtures.length) return null;
           return (
-            <div
-              key={i}
-              className="relative h-9 bg-house flex flex-col items-center justify-center"
-              style={on ? { background: `rgba(255,165,61,${0.06 + (v / 255) * 0.2})` } : undefined}
-              title={`Channel ${i + 1}`}
-            >
-              <span className="font-mono text-[7px] text-plot-faint leading-none">{i + 1}</span>
-              <span
-                className={`font-mono text-[10px] tnum leading-none mt-0.5 ${on ? "text-tungsten" : "text-plot-faint"}`}
-              >
-                {v}
-              </span>
+            <div key={pos}>
+              <div className="font-mono text-[9px] tracking-cue uppercase text-plot-faint mb-1">
+                {POSITION_LABEL[pos]}
+              </div>
+              <div className="space-y-px">
+                {fixtures.map((f) => {
+                  const n = CHANNELS[f.type];
+                  const level = dmx[f.patch - 1];
+                  const rgb = n >= 4 && f.type !== "moving"
+                    ? [dmx[f.patch], dmx[f.patch + 1], dmx[f.patch + 2]]
+                    : f.type === "moving"
+                      ? [dmx[f.patch + 2], dmx[f.patch + 3], dmx[f.patch + 4]]
+                      : null;
+                  const lit = level > 2;
+                  return (
+                    <div key={f.id} className="flex items-center gap-2 h-[18px]">
+                      <span className="font-mono text-[9px] text-plot-faint w-12 shrink-0 tnum">
+                        {f.patch}–{f.patch + n - 1}
+                      </span>
+                      <span className="font-mono text-[9px] text-plot-dim w-[86px] shrink-0 truncate">
+                        {f.label}
+                      </span>
+                      {/* level as a bar — the shape of the rig at a glance */}
+                      <div className="relative flex-1 h-[7px] bg-house overflow-hidden min-w-[24px]">
+                        <div
+                          className="absolute inset-y-0 left-0"
+                          style={{
+                            width: `${(level / 255) * 100}%`,
+                            background: rgb && lit ? `rgb(${rgb[0]},${rgb[1]},${rgb[2]})` : "#FFA53D",
+                            opacity: lit ? 0.9 : 0.25,
+                          }}
+                        />
+                      </div>
+                      <span
+                        className={`font-mono text-[9px] tnum w-6 text-right shrink-0 ${lit ? "text-plot" : "text-plot-faint"}`}
+                      >
+                        {level}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           );
         })}
       </div>
-      <p className="font-mono text-[9px] text-plot-faint mt-2">
-        Channels 1–{PATCHED_CHANNELS} patched · 512 in universe · would transmit over sACN at 44 Hz
+      <p className="font-mono text-[9px] text-plot-faint mt-3 leading-relaxed">
+        {RIG.length} fixtures · channels 1–{PATCHED_CHANNELS} patched of 512 · real personalities
+        (LED profile 4ch, moving head 8ch) · would transmit over sACN at 44 Hz
       </p>
     </div>
   );

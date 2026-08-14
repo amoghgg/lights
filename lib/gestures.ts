@@ -19,6 +19,14 @@ import {
   palmSeparation,
 } from "./landmarks";
 
+import {
+  CLAP_APART, CLAP_CLOSING_SPEED, CLAP_LOST_GRACE, CLAP_LOST_SEP, CLAP_MAX_GAP,
+  CLAP_MIN_GAP, CLAP_REARM_AFTER, CLAP_TOGETHER, COVER_HOLD, COVER_RAISED_Y,
+  DIM_MIN_FINGERS, DIM_SMOOTHING, GLOBAL_COOLDOWN, HAND_COUNT_DEBOUNCE,
+  POINT_HOLD, POINT_STILLNESS, SWIPE_COOLDOWN, SWIPE_MIN_SAMPLES, SWIPE_TRAVEL,
+  SWIPE_TWO_HAND_LOCKOUT, SWIPE_WINDOW,
+} from "./thresholds";
+
 export type CueId = "blackout" | "cover" | "special" | "dim" | "colour";
 
 export type CueEvent = {
@@ -84,60 +92,6 @@ export const CUES: {
   },
 ];
 
-// --- thresholds, in hand-spans, normalised frame units, or ms ----------------
-
-const CLAP_TOGETHER = 1.3; // palms this close counts as contact
-const CLAP_APART = 2.2; // palms this far apart re-arms the detector
-const CLAP_LOST_SEP = 2.4; // how close they must have been when tracking dropped
-const CLAP_CLOSING_SPEED = 4.5; // spans per second
-const CLAP_LOST_GRACE = 260; // ms after losing the pair that a clap still counts
-const CLAP_REARM_AFTER = 240; // ms — re-arm even if the pair is never re-acquired
-const CLAP_MIN_GAP = 120; // ms — below this it is one clap seen twice
-const CLAP_MAX_GAP = 900; // ms — above this it is two separate claps
-
-const COVER_HOLD = 400; // ms
-// Wrists must sit above this line. Generous, because a seated operator at a
-// laptop frames head-and-shoulders — hands never get near the top of frame.
-const COVER_RAISED_Y = 0.62;
-
-const POINT_HOLD = 500; // ms
-const POINT_STILLNESS = 0.035; // max palm travel per frame while "held"
-
-// Any open hand drives the master — orientation is not tested at all. Asking an
-// operator to hold a specific palm angle while also watching the stage was a
-// design mistake: the gesture has to survive being performed without looking.
-const DIM_MIN_FINGERS = 3;
-const DIM_SMOOTHING = 0.4;
-
-const SWIPE_WINDOW = 350; // ms
-const SWIPE_TRAVEL = 0.3; // normalised frame widths
-const SWIPE_MIN_SAMPLES = 4; // frames
-const SWIPE_COOLDOWN = 1500; // ms
-/**
- * A clap throws both hands sideways through the frame, and the moment the pair
- * merges the tracker reports one hand travelling fast — which is exactly what a
- * swipe looks like. Swiping is one-handed by definition, so anything within
- * this window of seeing two hands cannot be a swipe.
- */
-const SWIPE_TWO_HAND_LOCKOUT = 800; // ms
-
-const GLOBAL_COOLDOWN = 350; // ms after any discrete cue
-
-/**
- * Hand count flickers between one and two constantly at the edge of detection.
- * Switching cue branch on every flicker resets every hold timer, so the branch
- * follows a debounced count while the clap detector below reads the raw one.
- */
-const HAND_COUNT_DEBOUNCE = 110; // ms
-
-/**
- * Two separate histories, deliberately.
- *
- * They used to share one buffer, so two-handed motion fed the swipe detector —
- * every clap wrote a fast lateral track and fired a colour cue. Worse, the
- * colour cue then held the global cooldown open, which swallowed the very claps
- * that produced it. Keeping the buffers apart is what makes the clap reliable.
- */
 type SepSample = { t: number; sep: number };
 type XSample = { t: number; x: number };
 
@@ -504,3 +458,4 @@ export class GestureEngine {
 }
 
 export { handSpan };
+export { THRESHOLDS } from "./thresholds";
